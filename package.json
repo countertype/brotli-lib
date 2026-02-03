@@ -1,0 +1,66 @@
+{
+  "name": "brotli-lib",
+  "version": "0.0.1",
+  "description": "TypeScript Brotli encoder and decoder",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./encode": {
+      "types": "./dist/encode.d.ts",
+      "import": "./dist/encode.js",
+      "require": "./dist/encode.cjs"
+    },
+    "./decode": {
+      "types": "./dist/decode.d.ts",
+      "import": "./dist/decode.js",
+      "require": "./dist/decode.cjs"
+    }
+  },
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "LICENSE_THIRD_PARTY"
+  ],
+  "engines": {
+    "node": ">=12"
+  },
+  "scripts": {
+    "build": "rolldown -c && tsc --emitDeclarationOnly --declaration --outDir dist",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run test && npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "vitest bench",
+    "bench:encode": "vitest bench bench/encode.bench.ts",
+    "bench:decode": "vitest bench bench/decode.bench.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "brotli",
+    "encode",
+    "decode",
+    "compress",
+    "decompress",
+    "compression",
+    "typescript",
+    "tree-shaking"
+  ],
+  "author": "Jeremy Tribby, Countertype LLC",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.1.0",
+    "brotli": "^1.3.3",
+    "rolldown": "^1.0.0-beta.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}
