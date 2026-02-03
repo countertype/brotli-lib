@@ -52,9 +52,12 @@ export function createHuffmanTree(
     return { depths, bits }
   }
   
-  // Build Huffman tree using the standard algorithm
-  // Need space for: n leaf nodes + (n-1) internal nodes + 2 sentinels
-  const tree: HuffmanNode[] = new Array(2 * length + 2)
+  // Struct-of-arrays layout for less GC pressure
+  // Space: n leaves + (n-1) internal + 2 sentinels
+  const maxNodes = 2 * length + 2
+  const nodeCount = new Uint32Array(maxNodes)
+  const nodeLeft = new Int32Array(maxNodes)
+  const nodeRightOrValue = new Int32Array(maxNodes)
   
   // Retry with increasing count_limit until tree fits in treeLimit bits
   for (let countLimit = 1; ; countLimit *= 2) {
@@ -64,25 +67,23 @@ export function createHuffmanTree(
     for (let i = length - 1; i >= 0; i--) {
       if (histogram[i] > 0) {
         const count = Math.max(histogram[i], countLimit)
-        tree[n++] = {
-          totalCount: count,
-          indexLeft: -1,
-          indexRightOrValue: i,
-        }
+        nodeCount[n] = count >>> 0
+        nodeLeft[n] = -1
+        nodeRightOrValue[n] = i
+        n++
       }
     }
     
     // Sort leaf nodes by count (ascending), then by value (descending for ties)
-    sortHuffmanNodes(tree, n)
+    sortHuffmanNodesSoA(nodeCount, nodeLeft, nodeRightOrValue, n)
     
     // Add sentinel nodes
-    const sentinel: HuffmanNode = {
-      totalCount: 0xFFFFFFFF,
-      indexLeft: -1,
-      indexRightOrValue: -1,
-    }
-    tree[n] = sentinel
-    tree[n + 1] = sentinel
+    nodeCount[n] = 0xFFFFFFFF
+    nodeLeft[n] = -1
+    nodeRightOrValue[n] = -1
+    nodeCount[n + 1] = 0xFFFFFFFF
+    nodeLeft[n + 1] = -1
+    nodeRightOrValue[n + 1] = -1
     
     // Build tree bottom-up
     let i = 0  // Points to next leaf node
@@ -91,14 +92,14 @@ export function createHuffmanTree(
     for (let k = n - 1; k > 0; k--) {
       // Select two smallest nodes
       let left: number
-      if (tree[i].totalCount <= tree[j].totalCount) {
+      if (nodeCount[i] <= nodeCount[j]) {
         left = i++
       } else {
         left = j++
       }
       
       let right: number
-      if (tree[i].totalCount <= tree[j].totalCount) {
+      if (nodeCount[i] <= nodeCount[j]) {
         right = i++
       } else {
         right = j++
@@ -106,16 +107,16 @@ export function createHuffmanTree(
       
       // Create internal node
       const jEnd = 2 * n - k
-      tree[jEnd] = {
-        totalCount: tree[left].totalCount + tree[right].totalCount,
-        indexLeft: left,
-        indexRightOrValue: right,
-      }
-      tree[jEnd + 1] = sentinel
+      nodeCount[jEnd] = (nodeCount[left] + nodeCount[right]) >>> 0
+      nodeLeft[jEnd] = left
+      nodeRightOrValue[jEnd] = right
+      nodeCount[jEnd + 1] = 0xFFFFFFFF
+      nodeLeft[jEnd + 1] = -1
+      nodeRightOrValue[jEnd + 1] = -1
     }
     
     // Traverse tree to set depths
-    if (setDepth(2 * n - 1, tree, depths, treeLimit)) {
+    if (setDepthSoA(2 * n - 1, nodeLeft, nodeRightOrValue, depths, treeLimit)) {
       break
     }
     
@@ -129,9 +130,10 @@ export function createHuffmanTree(
   return { depths, bits }
 }
 
-function setDepth(
+function setDepthSoA(
   root: number,
-  tree: HuffmanNode[],
+  nodeLeft: Int32Array,
+  nodeRightOrValue: Int32Array,
   depths: Uint8Array,
   maxDepth: number
 ): boolean {
@@ -141,16 +143,17 @@ function setDepth(
   stack[0] = -1
   
   while (true) {
-    if (tree[p].indexLeft >= 0) {
+    const left = nodeLeft[p]
+    if (left >= 0) {
       // Internal node - go left
       level++
       if (level > maxDepth) return false
-      stack[level] = tree[p].indexRightOrValue
-      p = tree[p].indexLeft
+      stack[level] = nodeRightOrValue[p]
+      p = left
       continue
     } else {
       // Leaf node - set depth
-      depths[tree[p].indexRightOrValue] = level
+      depths[nodeRightOrValue[p]] = level
     }
     
     // Backtrack
@@ -161,19 +164,36 @@ function setDepth(
   }
 }
 
-function sortHuffmanNodes(nodes: HuffmanNode[], n: number): void {
+function sortHuffmanNodesSoA(
+  nodeCount: Uint32Array,
+  nodeLeft: Int32Array,
+  nodeRightOrValue: Int32Array,
+  n: number
+): void {
+  // Smaller count first; ties break by larger value
+  const less = (aCount: number, aVal: number, bCount: number, bVal: number): boolean => {
+    if (aCount !== bCount) return aCount < bCount
+    return aVal > bVal
+  }
+
   if (n < 13) {
     // Insertion sort for small arrays
     for (let i = 1; i < n; i++) {
-      const tmp = nodes[i]
+      const tmpCount = nodeCount[i]
+      const tmpLeft = nodeLeft[i]
+      const tmpRightOrVal = nodeRightOrValue[i]
       let k = i
       let j = i - 1
-      while (j >= 0 && compareNodes(tmp, nodes[j])) {
-        nodes[k] = nodes[j]
+      while (j >= 0 && less(tmpCount, tmpRightOrVal, nodeCount[j], nodeRightOrValue[j])) {
+        nodeCount[k] = nodeCount[j]
+        nodeLeft[k] = nodeLeft[j]
+        nodeRightOrValue[k] = nodeRightOrValue[j]
         k = j
         j--
       }
-      nodes[k] = tmp
+      nodeCount[k] = tmpCount
+      nodeLeft[k] = tmpLeft
+      nodeRightOrValue[k] = tmpRightOrVal
     }
   } else {
     // Shell sort
@@ -182,22 +202,21 @@ function sortHuffmanNodes(nodes: HuffmanNode[], n: number): void {
       const gap = SHELL_GAPS[g]
       for (let i = gap; i < n; i++) {
         let j = i
-        const tmp = nodes[i]
-        while (j >= gap && compareNodes(tmp, nodes[j - gap])) {
-          nodes[j] = nodes[j - gap]
+        const tmpCount = nodeCount[i]
+        const tmpLeft = nodeLeft[i]
+        const tmpRightOrVal = nodeRightOrValue[i]
+        while (j >= gap && less(tmpCount, tmpRightOrVal, nodeCount[j - gap], nodeRightOrValue[j - gap])) {
+          nodeCount[j] = nodeCount[j - gap]
+          nodeLeft[j] = nodeLeft[j - gap]
+          nodeRightOrValue[j] = nodeRightOrValue[j - gap]
           j -= gap
         }
-        nodes[j] = tmp
+        nodeCount[j] = tmpCount
+        nodeLeft[j] = tmpLeft
+        nodeRightOrValue[j] = tmpRightOrVal
       }
     }
   }
-}
-
-function compareNodes(a: HuffmanNode, b: HuffmanNode): boolean {
-  if (a.totalCount !== b.totalCount) {
-    return a.totalCount < b.totalCount
-  }
-  return a.indexRightOrValue > b.indexRightOrValue
 }
 
 function reverseBits(numBits: number, bits: number): number {

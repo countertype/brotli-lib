@@ -38,7 +38,7 @@ export function backwardReferencePenaltyUsingLastDistance(distanceShortCode: num
   return 39 + ((0x1CA10 >> (distanceShortCode & 0xE)) & 0xE)
 }
 
-// Performance-critical match length finder
+// 4-byte unrolled comparison with early exit
 export function findMatchLength(
   data: Uint8Array,
   s1: number,
@@ -47,18 +47,28 @@ export function findMatchLength(
 ): number {
   let matched = 0
   
-  // Fast path: check 4 bytes at a time
+  // Compare 4 bytes at a time
   while (matched + 4 <= limit) {
-    if (data[s1 + matched] !== data[s2 + matched] ||
-        data[s1 + matched + 1] !== data[s2 + matched + 1] ||
-        data[s1 + matched + 2] !== data[s2 + matched + 2] ||
-        data[s1 + matched + 3] !== data[s2 + matched + 3]) {
-      break
-    }
+    const a0 = data[s1 + matched]
+    const b0 = data[s2 + matched]
+    if (a0 !== b0) return matched
+    
+    const a1 = data[s1 + matched + 1]
+    const b1 = data[s2 + matched + 1]
+    if (a1 !== b1) return matched + 1
+    
+    const a2 = data[s1 + matched + 2]
+    const b2 = data[s2 + matched + 2]
+    if (a2 !== b2) return matched + 2
+    
+    const a3 = data[s1 + matched + 3]
+    const b3 = data[s2 + matched + 3]
+    if (a3 !== b3) return matched + 3
+    
     matched += 4
   }
   
-  // Slow path: byte by byte
+  // Handle remaining bytes
   while (matched < limit && data[s1 + matched] === data[s2 + matched]) {
     matched++
   }
@@ -148,15 +158,13 @@ export function createDistanceCache(): Int32Array {
 }
 
 export const HASH_MUL_32 = 0x1E35A7BD
-export const HASH_MUL_64 = 0x1E35A7BDn
 
 export function hashBytes4(data: Uint8Array, pos: number, bucketBits: number): number {
-  // Read 4 bytes as little-endian 32-bit integer (handle out of bounds)
-  const b0 = pos < data.length ? data[pos] : 0
-  const b1 = pos + 1 < data.length ? data[pos + 1] : 0
-  const b2 = pos + 2 < data.length ? data[pos + 2] : 0
-  const b3 = pos + 3 < data.length ? data[pos + 3] : 0
-  const h32 = (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)) >>> 0
+  // Read 4 bytes little-endian
+  const h32 = (data[pos] | 
+               (data[pos + 1] << 8) | 
+               (data[pos + 2] << 16) | 
+               (data[pos + 3] << 24)) >>> 0
   
   // Multiply and take high bits
   const h = Math.imul(h32, HASH_MUL_32) >>> 0
@@ -169,17 +177,47 @@ export function hashBytes8(
   hashLen: number, 
   bucketBits: number
 ): number {
-  // Read 8 bytes as little-endian 64-bit integer
-  let h64 = 0n
-  for (let i = 0; i < 8; i++) {
-    const byte = pos + i < data.length ? data[pos + i] : 0
-    h64 |= BigInt(byte) << BigInt(i * 8)
+  // Fast path for hashLen=5 (common case)
+  if (hashLen === 5) {
+    const h32 = (data[pos] |
+                 (data[pos + 1] << 8) |
+                 (data[pos + 2] << 16) |
+                 (data[pos + 3] << 24)) >>> 0
+    const b4 = data[pos + 4] | 0
+    const h = Math.imul(h32 ^ (b4 << 24), HASH_MUL_32) >>> 0
+    return h >>> (32 - bucketBits)
   }
-  
-  // Shift to keep only hashLen bytes, then multiply
-  const shift = BigInt(64 - 8 * hashLen)
-  h64 = (h64 << shift) * HASH_MUL_64
-  
-  // Take high bits
-  return Number(h64 >> BigInt(64 - bucketBits))
+
+  // Generic path for hashLen 1..8
+  let h32 = (data[pos] |
+             (data[pos + 1] << 8) |
+             (data[pos + 2] << 16) |
+             (data[pos + 3] << 24)) >>> 0
+
+  // Mask to hashLen bytes
+  if (hashLen <= 0) {
+    h32 = 0
+  } else if (hashLen === 1) {
+    h32 &= 0xFF
+  } else if (hashLen === 2) {
+    h32 &= 0xFFFF
+  } else if (hashLen === 3) {
+    h32 &= 0xFFFFFF
+  }
+
+  // Mix in bytes 4..7 if needed
+  if (hashLen > 4) {
+    const keep = hashLen - 4
+    let tail = (data[pos + 4] |
+                (data[pos + 5] << 8) |
+                (data[pos + 6] << 16) |
+                (data[pos + 7] << 24)) >>> 0
+    if (keep === 1) tail &= 0xFF
+    else if (keep === 2) tail &= 0xFFFF
+    else if (keep === 3) tail &= 0xFFFFFF
+    h32 ^= tail
+  }
+
+  const h = Math.imul(h32, HASH_MUL_32) >>> 0
+  return h >>> (32 - bucketBits)
 }

@@ -222,8 +222,16 @@ export class HashChainHasher {
       prevIx = this.chains[prevIx & this.windowMask]
     }
     
-    // Sort by length
-    matches.sort((a, b) => a.length - b.length)
+    // Insertion sort by length
+    for (let i = 1; i < matches.length; i++) {
+      const item = matches[i]
+      let j = i - 1
+      while (j >= 0 && matches[j].length > item.length) {
+        matches[j + 1] = matches[j]
+        j--
+      }
+      matches[j + 1] = item
+    }
     
     return matches
   }

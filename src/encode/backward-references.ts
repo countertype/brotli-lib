@@ -28,6 +28,9 @@ export function createBackwardReferences(
   const posEnd = position + numBytes
   const maxWindowBackward = (1 << 22) - 16 // lgwin=22 default
   
+  // Reuse to avoid alloc in loop
+  const result = { len: 0, distance: 0, score: 0, lenCodeDelta: 0 }
+  
   while (pos < posEnd) {
     const maxLen = posEnd - pos
     if (maxLen < 4) {
@@ -40,8 +43,11 @@ export function createBackwardReferences(
     // Maximum backward distance depends on current position
     const maxBackward = Math.min(pos, maxWindowBackward)
     
-    // Find best match at this position
-    const result = createSearchResult()
+    // Reset and find best match at this position
+    result.len = 0
+    result.distance = 0
+    result.score = 0
+    result.lenCodeDelta = 0
     hasher.findLongestMatch(
       ringbuffer,
       ringbufferMask,

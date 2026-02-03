@@ -5,7 +5,7 @@ import {
   BackwardMatch,
   findMatchLength,
   hashBytes4,
-  createBackwardMatch,
+  backwardReferenceScore,
 } from './match'
 
 export const BUCKET_BITS = 17
@@ -113,7 +113,13 @@ export class BinaryTreeHasher {
       
       if (matches && len > bestLen) {
         bestLen = len
-        result.push(createBackwardMatch(backward, len))
+        // Inline to avoid call overhead
+        result.push({
+          distance: backward,
+          length: len,
+          score: backwardReferenceScore(len, backward),
+          lenCodeDelta: 0,
+        })
       }
       
       if (len >= maxCompLen) {
@@ -177,7 +183,13 @@ export class BinaryTreeHasher {
       const len = findMatchLength(data, prevIxMasked, curIxMasked, maxLength)
       if (len > bestLen) {
         bestLen = len
-        matches.push(createBackwardMatch(backward, len))
+        // Inline
+        matches.push({
+          distance: backward,
+          length: len,
+          score: backwardReferenceScore(len, backward),
+          lenCodeDelta: 0,
+        })
       }
     }
     
@@ -200,8 +212,16 @@ export class BinaryTreeHasher {
       )
     }
     
-    // Sort by length (ascending)
-    matches.sort((a, b) => a.length - b.length)
+    // Insertion sort by length
+    for (let i = 1; i < matches.length; i++) {
+      const item = matches[i]
+      let j = i - 1
+      while (j >= 0 && matches[j].length > item.length) {
+        matches[j + 1] = matches[j]
+        j--
+      }
+      matches[j + 1] = item
+    }
     
     return matches
   }
