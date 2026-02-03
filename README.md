@@ -85,11 +85,11 @@ Encoder vs Node.js native `zlib.brotliCompressSync` (quality 11):
 
 | Input | brotli-lib | node:zlib |
 |-------|-----------|-----------|
-| 13 B | 0.0005 ms | 0.15 ms |
-| 4.5 KB | 0.39 ms | 0.34 ms |
-| 45 KB | 2.7 ms | 1.4 ms |
+| 13 B | 0.0004 ms | 0.22 ms |
+| 4.5 KB | 0.38 ms | 0.43 ms |
+| 45 KB | 3.5 ms | 1.6 ms |
 
-Much faster for tiny inputs (no native binding overhead), comparable for medium, 2x slower for large
+Much faster for tiny inputs (no native binding overhead), faster for medium, 2x slower for large
 
 Run `npm run bench` to reproduce
 

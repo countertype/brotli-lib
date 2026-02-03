@@ -12,7 +12,6 @@
 - Hashers: inline match creation, insertion sort
 - `createHuffmanTree`: struct-of-arrays layout
 
-
 ## 0.0.1 - 2026-02-02
 
 init
