@@ -403,7 +403,9 @@ export function createZopfliBackwardReferences(
   quality: number,
   hasher: BinaryTreeHasher,
   distCache: Int32Array,
-  lastInsertLen: number
+  lastInsertLen: number,
+  npostfix: number = 0,
+  ndirect: number = 0
 ): [Command[], number, number] {
   const maxBackwardLimit = (1 << 22) - 16 // lgwin=22 default
   const maxZopfliLenVal = maxZopfliLen(quality)
@@ -463,7 +465,7 @@ export function createZopfliBackwardReferences(
   computeShortestPathFromNodes(numBytes, nodes)
   
   // Create commands from path
-  return createCommandsFromPath(numBytes, position, nodes, distCache, lastInsertLen)
+  return createCommandsFromPath(numBytes, position, nodes, distCache, lastInsertLen, npostfix, ndirect)
 }
 
 // Two-pass optimization for quality 11
@@ -474,7 +476,9 @@ export function createHqZopfliBackwardReferences(
   ringbufferMask: number,
   hasher: BinaryTreeHasher,
   distCache: Int32Array,
-  lastInsertLen: number
+  lastInsertLen: number,
+  npostfix: number = 0,
+  ndirect: number = 0
 ): [Command[], number, number] {
   const quality = 11
   const maxBackwardLimit = (1 << 22) - 16
@@ -577,7 +581,7 @@ export function createHqZopfliBackwardReferences(
     // Compute path and create commands
     computeShortestPathFromNodes(numBytes, nodes)
     ;[commands, numLiterals, finalLastInsertLen] = createCommandsFromPath(
-      numBytes, position, nodes, distCache, lastInsertLen
+      numBytes, position, nodes, distCache, lastInsertLen, npostfix, ndirect
     )
   }
   
@@ -589,7 +593,9 @@ function createCommandsFromPath(
   blockStart: number,
   nodes: ZopfliNode[],
   distCache: Int32Array,
-  lastInsertLen: number
+  lastInsertLen: number,
+  npostfix: number = 0,
+  ndirect: number = 0
 ): [Command[], number, number] {
   const maxBackwardLimit = (1 << 22) - 16
   const commands: Command[] = []
@@ -619,7 +625,9 @@ function createCommandsFromPath(
       insertLen,
       copyLen,
       lenCode - copyLen,
-      distCode
+      distCode,
+      ndirect,
+      npostfix
     )
     commands.push(cmd)
     

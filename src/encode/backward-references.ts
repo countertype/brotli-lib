@@ -19,7 +19,9 @@ export function createBackwardReferences(
   hasher: SimpleHasher | HashChainHasher,
   distCache: Int32Array,
   lastInsertLen: number,
-  _quality: number
+  _quality: number,
+  npostfix: number = 0,
+  ndirect: number = 0
 ): [Command[], number, number] {
   const commands: Command[] = []
   let numLiterals = 0
@@ -78,7 +80,9 @@ export function createBackwardReferences(
         insertLen,
         matchLen,
         result.lenCodeDelta,
-        distCode
+        distCode,
+        ndirect,
+        npostfix
       )
       commands.push(cmd)
       numLiterals += insertLen
