@@ -149,6 +149,30 @@ describe('brotliEncode', () => {
     expect(q11.length).toBeGreaterThan(0)
   })
 
+  it('supports FONT mode', () => {
+    // Simulate font-like data with repetitive 4-byte structures
+    const fontData = new Uint8Array(4096)
+    for (let i = 0; i < fontData.length; i += 4) {
+      fontData[i] = i & 0xFF
+      fontData[i + 1] = (i >> 8) & 0xFF
+      fontData[i + 2] = 0
+      fontData[i + 3] = 0
+    }
+
+    const generic = brotliEncode(fontData, { quality: 5 })
+    const font = brotliEncode(fontData, { quality: 5, mode: 2 }) // EncoderMode.FONT
+
+    // Both should produce valid output
+    expect(generic.length).toBeGreaterThan(0)
+    expect(font.length).toBeGreaterThan(0)
+
+    // Both should decode correctly
+    const decodedGeneric = brotliDecode(generic)
+    const decodedFont = brotliDecode(font)
+    expect(decodedGeneric).toEqual(fontData)
+    expect(decodedFont).toEqual(fontData)
+  })
+
   describe('streaming encoder', () => {
     it('encodes in chunks', () => {
       const encoder = new BrotliEncoder({ quality: 5 })

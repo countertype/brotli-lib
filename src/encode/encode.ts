@@ -17,7 +17,7 @@ import { BinaryTreeHasher, createBinaryTreeHasher } from './hash-binary-tree'
 import { createBackwardReferences } from './backward-references'
 import { createZopfliBackwardReferences, createHqZopfliBackwardReferences } from './backward-references-hq'
 import { Command, createInsertCommand, commandCopyLen } from './command'
-import { storeMetaBlockTrivial, storeUncompressedMetaBlock } from './metablock'
+import { storeMetaBlockTrivial, storeMetaBlock, storeUncompressedMetaBlock } from './metablock'
 
 export interface BrotliEncodeOptions {
   quality?: number    // 0-11, default 11
@@ -262,9 +262,9 @@ function encodeStandard(input: Uint8Array, params: EncoderParams): Uint8Array {
     
     // Store metablock
     const distAlphabetSize = calculateDistanceAlphabetSize(params)
-    storeMetaBlockTrivial(
+    storeMetaBlock(
       writer, input, pos, metablockLen, ringBufferMask,
-      isLast, commands, distAlphabetSize
+      isLast, commands, distAlphabetSize, params.quality
     )
     
     pos += metablockLen

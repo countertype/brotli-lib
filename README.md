@@ -62,7 +62,7 @@ class BrotliEncoder {
 
 ### Decode
 
-|  | brotli-lib | brotli.js | Google brotli |
+|  | brotli-lib | brotli.js | Google decode.ts |
 |--|------------|-----------|---------------|
 | Speed (vs Google) | 1.0x | 0.5-0.6x | 1x |
 | Custom dictionary | yes | no | yes |
@@ -70,7 +70,7 @@ class BrotliEncoder {
 
 Decode times (Apple M2 Max, Node 22):
 
-| File | brotli-lib | brotli.js | Google brotli |
+| File | brotli-lib | brotli.js | Google decode.ts |
 |------|------------|-----------|---------------|
 | enc-ttf (305 KB) | 3.0 ms | 5.2 ms | 3.1 ms |
 | enc-otf (253 KB) | 3.0 ms | 5.2 ms | 3.1 ms |
@@ -83,13 +83,13 @@ Decode times (Apple M2 Max, Node 22):
 
 Encoder vs Node.js native `zlib.brotliCompressSync` (quality 11):
 
-| Input | brotli-lib | node:zlib |
-|-------|-----------|-----------|
-| 13 B | 0.0004 ms | 0.22 ms |
-| 4.5 KB | 0.38 ms | 0.43 ms |
-| 45 KB | 3.5 ms | 1.6 ms |
+| Input | brotli-lib | node:zlib | vs native |
+|-------|-----------|-----------|-----------|
+| 13 B | 0.001 ms | 0.16 ms | 160x faster |
+| 4.5 KB | 0.27 ms | 0.33 ms | 1.2x faster |
+| 45 KB | 3.0 ms | 1.4 ms | 2x slower |
 
-Much faster for tiny inputs (no native binding overhead), faster for medium, 2x slower for large
+Much faster for tiny inputs (no native binding overhead), faster for medium, ~2x slower for large
 
 Run `npm run bench` to reproduce
 
@@ -97,11 +97,11 @@ Run `npm run bench` to reproduce
 
 | Import | Export size (gzip) |
 |--------|--------------------|
+| `brotli-lib/encode` | 25 KB |
 | `brotli-lib/decode` | 66 KB |
-| `brotli-lib/encode` | 16 KB |
-| `brotli-lib` | 82 KB |
+| `brotli-lib` | 90 KB |
 
-The 122 KB static dictionary is compressed to 52 KB and bootstrapped at runtime (à la Devon Govett's brotli.js)
+The 122 KB static dictionary is compressed to 52 KB and bootstrapped at runtime (à la Devon Govett's brotli.js).
 
 ## License
 
