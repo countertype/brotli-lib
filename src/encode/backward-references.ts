@@ -145,14 +145,6 @@ export function distanceToCode(distance: number, distCache: Int32Array): number 
   return distance + NUM_DISTANCE_SHORT_CODES - 1
 }
 
-export function codeToDistance(code: number, distCache: Int32Array): number {
-  if (code < NUM_DISTANCE_SHORT_CODES) {
-    const idx = DISTANCE_CACHE_INDEX[code]
-    return distCache[idx] + DISTANCE_CACHE_OFFSET[code]
-  }
-  return code - NUM_DISTANCE_SHORT_CODES + 1
-}
-
 export function backwardMatchLength(match: BackwardMatch): number {
   return match.length
 }

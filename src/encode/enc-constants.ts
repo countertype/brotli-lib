@@ -117,6 +117,13 @@ export function sanitizeParams(params: EncoderParams): void {
   
   const maxLgwin = params.largeWindow ? LARGE_MAX_WINDOW_BITS : MAX_WINDOW_BITS
   params.lgwin = Math.max(MIN_WINDOW_BITS, Math.min(maxLgwin, params.lgwin))
+  
+  // FONT mode uses different distance parameters optimized for font data
+  if (params.quality >= MIN_QUALITY_FOR_NONZERO_DISTANCE_PARAMS &&
+      params.mode === EncoderMode.FONT) {
+    params.dist.distancePostfixBits = 1
+    params.dist.numDirectDistanceCodes = 12
+  }
 }
 
 export function computeLgBlock(params: EncoderParams): number {

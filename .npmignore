@@ -1,0 +1,24 @@
+# Source and config
+src/
+tsconfig.json
+rolldown.config.js
+
+# Development
+test/
+bench/
+*.test.ts
+*.bench.ts
+
+# Git
+.git/
+.gitignore
+.gitmodules
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Misc
+*.log
+.DS_Store
