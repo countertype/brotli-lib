@@ -58,6 +58,8 @@ class BrotliEncoder {
 }
 ```
 
+FONT mode uses distance coding parameters optimized for transformed font data. It doesn't improve compression on raw TTF/OTF files - the gains come from WOFF2's font-specific transforms (glyf, loca, hmtx) applied before brotli compression
+
 ## Performance
 
 ### Decode
