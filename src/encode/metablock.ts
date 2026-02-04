@@ -295,7 +295,9 @@ export function storeMetaBlockTrivial(
   mask: number,
   isLast: boolean,
   commands: Command[],
-  distanceAlphabetSize: number
+  distanceAlphabetSize: number,
+  npostfix: number = 0,
+  ndirect: number = 0
 ): void {
   // Store header
   storeCompressedMetaBlockHeader(writer, isLast, length)
@@ -322,8 +324,23 @@ export function storeMetaBlockTrivial(
     }
   }
   
-  // 13 zero bits: NBLTYPESL=1, NBLTYPESI=1, NBLTYPESD=1, NPOSTFIX=0, NDIRECT=0
-  writer.writeBits(13, 0)
+  // Block type counts (all 1 for trivial)
+  storeVarLenUint8(writer, 0) // NBLTYPESL - 1
+  storeVarLenUint8(writer, 0) // NBLTYPESI - 1
+  storeVarLenUint8(writer, 0) // NBLTYPESD - 1
+  
+  // Distance parameters
+  writer.writeBits(2, npostfix)
+  writer.writeBits(4, ndirect >> npostfix)
+  
+  // Literal context (trivial: 1 tree, 1 context mode)
+  storeVarLenUint8(writer, 0) // NTREESL - 1
+  writer.writeBits(2, 0) // Context mode (CONTEXT_LSB6)
+  // Literal context map omitted (only 1 tree)
+  
+  // Distance context (trivial: 1 tree)
+  storeVarLenUint8(writer, 0) // NTREESD - 1
+  // Distance context map omitted (only 1 tree)
   
   // Build and store Huffman trees
   const litDepths = new Uint8Array(NUM_LITERAL_CODES)
@@ -493,11 +510,13 @@ export function storeMetaBlock(
   isLast: boolean,
   commands: Command[],
   distanceAlphabetSize: number,
-  quality: number
+  quality: number,
+  npostfix: number = 0,
+  ndirect: number = 0
 ): void {
   // For short inputs or low quality, use trivial encoding
   if (length < 128 || quality < 5 || commands.length < 6) {
-    storeMetaBlockTrivial(writer, input, startPos, length, mask, isLast, commands, distanceAlphabetSize)
+    storeMetaBlockTrivial(writer, input, startPos, length, mask, isLast, commands, distanceAlphabetSize, npostfix, ndirect)
     return
   }
 
@@ -510,7 +529,7 @@ export function storeMetaBlock(
 
   // If splitting didn't produce multiple block types, use trivial encoding
   if (literalSplit.numTypes <= 1 && commandSplit.numTypes <= 1 && distanceSplit.numTypes <= 1) {
-    storeMetaBlockTrivial(writer, input, startPos, length, mask, isLast, commands, distanceAlphabetSize)
+    storeMetaBlockTrivial(writer, input, startPos, length, mask, isLast, commands, distanceAlphabetSize, npostfix, ndirect)
     return
   }
 
@@ -672,9 +691,9 @@ export function storeMetaBlock(
   commandEnc.buildAndStoreEntropyCodes(writer)
   distanceEnc.buildAndStoreEntropyCodes(writer)
 
-  // Store NPOSTFIX and NDIRECT (both 0)
-  writer.writeBits(2, 0) // NPOSTFIX
-  writer.writeBits(4, 0) // NDIRECT >> NPOSTFIX
+  // Store NPOSTFIX and NDIRECT
+  writer.writeBits(2, npostfix)
+  writer.writeBits(4, ndirect >> npostfix)
 
   // Store context modes for literal (one per block type)
   for (let i = 0; i < literalSplit.numTypes; i++) {

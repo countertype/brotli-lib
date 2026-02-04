@@ -160,14 +160,16 @@ function encodeFast(input: Uint8Array, params: EncoderParams): Uint8Array {
     // Find backward references
     const [commands] = createBackwardReferences(
       blockLen, pos, input, ringBufferMask,
-      hasher, distCache, 0, params.quality
+      hasher, distCache, 0, params.quality,
+      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
     )
     
     // Store metablock
-    const distAlphabetSize = 16 + (48 << params.dist.distancePostfixBits)
+    const distAlphabetSize = 16 + params.dist.numDirectDistanceCodes + (48 << params.dist.distancePostfixBits)
     storeMetaBlockTrivial(
       writer, input, pos, blockLen, ringBufferMask,
-      isLast, commands, distAlphabetSize
+      isLast, commands, distAlphabetSize,
+      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
     )
     
     pos += blockLen
@@ -216,25 +218,29 @@ function encodeStandard(input: Uint8Array, params: EncoderParams): Uint8Array {
       // Quality 11: use HQ Zopfli
       [commands, , lastInsertLen] = createHqZopfliBackwardReferences(
         metablockLen, pos, input, ringBufferMask,
-        hasher, distCache, 0
+        hasher, distCache, 0,
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
       )
     } else if (params.quality >= ZOPFLIFICATION_QUALITY && hasher instanceof BinaryTreeHasher) {
       // Quality 10: use Zopfli
       [commands, , lastInsertLen] = createZopfliBackwardReferences(
         metablockLen, pos, input, ringBufferMask,
-        params.quality, hasher, distCache, 0
+        params.quality, hasher, distCache, 0,
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
       )
     } else if (hasher instanceof HashChainHasher) {
       // Quality 5-9: use hash chains
       [commands, , lastInsertLen] = createBackwardReferences(
         metablockLen, pos, input, ringBufferMask,
-        hasher, distCache, 0, params.quality
+        hasher, distCache, 0, params.quality,
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
       )
     } else if (hasher instanceof SimpleHasher) {
       // Quality 2-4: use simple hasher
       [commands, , lastInsertLen] = createBackwardReferences(
         metablockLen, pos, input, ringBufferMask,
-        hasher, distCache, 0, params.quality
+        hasher, distCache, 0, params.quality,
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
       )
     } else {
       // Fallback
@@ -264,7 +270,8 @@ function encodeStandard(input: Uint8Array, params: EncoderParams): Uint8Array {
     const distAlphabetSize = calculateDistanceAlphabetSize(params)
     storeMetaBlock(
       writer, input, pos, metablockLen, ringBufferMask,
-      isLast, commands, distAlphabetSize, params.quality
+      isLast, commands, distAlphabetSize, params.quality,
+      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
     )
     
     pos += metablockLen
@@ -417,18 +424,21 @@ export class BrotliEncoder {
     if (hasher instanceof SimpleHasher || hasher instanceof HashChainHasher) {
       [commands, numLiterals, lastInsertLen] = createBackwardReferences(
         blockLen, pos, ringBuffer, ringBufferMask,
-        hasher, distCache, this.state.lastInsertLen, params.quality
+        hasher, distCache, this.state.lastInsertLen, params.quality,
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
       )
     } else if (hasher instanceof BinaryTreeHasher) {
       if (params.quality >= HQ_ZOPFLIFICATION_QUALITY) {
         [commands, numLiterals, lastInsertLen] = createHqZopfliBackwardReferences(
           blockLen, pos, ringBuffer, ringBufferMask,
-          hasher, distCache, this.state.lastInsertLen
+          hasher, distCache, this.state.lastInsertLen,
+          params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
         )
       } else {
         [commands, numLiterals, lastInsertLen] = createZopfliBackwardReferences(
           blockLen, pos, ringBuffer, ringBufferMask,
-          params.quality, hasher, distCache, this.state.lastInsertLen
+          params.quality, hasher, distCache, this.state.lastInsertLen,
+          params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
         )
       }
     } else {
@@ -460,7 +470,8 @@ export class BrotliEncoder {
     const distAlphabetSize = calculateDistanceAlphabetSize(params)
     storeMetaBlockTrivial(
       writer, ringBuffer, pos, blockLen, ringBufferMask,
-      isLast, commands, distAlphabetSize
+      isLast, commands, distAlphabetSize,
+      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
     )
     
     // Update state

@@ -4,10 +4,11 @@
 
 ### Fixed
 - Encoder correctness: fixed `BLOCK_LENGTH_PREFIX_RANGES` table to match decoder spec, resolving bit misalignment in block splitting
+- FONT mode: correctly propagate `npostfix`/`ndirect` parameters through all encoder paths (commands, metablock header, fallback paths)
 
 ### Added
 - Full block splitting and context modeling for quality 5+
-- FONT mode (`mode: 'FONT'`) with optimized distance parameters for font data
+- FONT mode (`mode: 'FONT'`) with optimized distance parameters (`npostfix=1`, `ndirect=12`) for WOFF2 transformed font data
 
 ## 0.0.2 - 2026-02-03
 
