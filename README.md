@@ -66,7 +66,7 @@ FONT mode uses distance coding parameters optimized for transformed font data. I
 
 |  | brotli-lib | brotli.js | Google decode.ts |
 |--|------------|-----------|---------------|
-| Speed (vs Google) | 1.0x | 0.5-0.6x | 1x |
+| Speed (vs Google) | 1.05-1.1x | 0.5-0.6x | 1x |
 | Custom dictionary | yes | no | yes |
 | Compressed static dict | yes | yes | no |
 
@@ -74,12 +74,12 @@ Decode times (Apple M2 Max, Node 22):
 
 | File | brotli-lib | brotli.js | Google decode.ts |
 |------|------------|-----------|---------------|
-| enc-ttf (305 KB) | 3.0 ms | 5.2 ms | 3.1 ms |
-| enc-otf (253 KB) | 3.0 ms | 5.2 ms | 3.1 ms |
-| enc-var-ttf (788 KB) | 7.5 ms | 13.8 ms | 7.8 ms |
-| noto-tc (7 MB) | 61 ms | 106 ms | 63 ms |
+| enc-ttf (305 KB) | 2.5 ms | 4.5 ms | 2.8 ms |
+| enc-otf (253 KB) | 2.5 ms | 4.3 ms | 2.7 ms |
+| enc-var-ttf (788 KB) | 6.8 ms | 11.8 ms | 7.1 ms |
+| noto-tc (7 MB) | 55 ms | 90 ms | 57 ms |
 
-1.7x faster than brotli.js, on par with or slightly faster than Google's JS decoder
+1.7x faster than brotli.js, 5-10% faster than Google's JS decoder
 
 ### Encode
 

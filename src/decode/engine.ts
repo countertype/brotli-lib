@@ -26,6 +26,16 @@ const CMD_LOOKUP = new Int16Array(2816);
   unpackCommandLookupTable(CMD_LOOKUP);
 }
 const IS_LITTLE_ENDIAN = new Uint16Array(new Uint8Array([1, 0]).buffer)[0] === 1;
+// Pre-allocated scratch buffers — avoids per-call GC pressure
+const _scratchCount = new Int32Array(16);
+const _scratchOffset = new Int32Array(16);
+const _scratchSorted = new Int32Array(1080); // max from MAX_HUFFMAN_TABLE_SIZE
+const _scratchHCLTable = new Int32Array(33); // readHuffmanCodeLengths
+const _scratchCLCL = new Int32Array(18); // readComplexHuffmanCode codeLengthCodeLengths
+const _scratchCodeLengths = new Int32Array(1080); // readSimpleHuffmanCode / readComplexHuffmanCode
+const _scratchSymbols = new Int32Array(4); // readSimpleHuffmanCode
+const _scratchMtf = new Int32Array(256); // inverseMoveToFrontTransform
+const _scratchCtxMapTable = new Int32Array(1081); // decodeContextMap (max tableSize + 1)
 function log2floor(i: number): number {
   let result: number = -1;
   let step = 16;
@@ -275,16 +285,12 @@ function readBlockLength(tableGroup: Int32Array, tableIdx: number, s: State): nu
   return BLOCK_LENGTH_OFFSET[code] + ((n <= 16) ? readFewBits(s, n) : readManyBits(s, n));
 }
 function moveToFront(v: Int32Array, index: number): void {
-  let i: number = index;
-  const value: number = v[i];
-  while (i > 0) {
-    v[i] = v[i - 1];
-    i--;
-  }
+  const value: number = v[index];
+  v.copyWithin(1, 0, index);
   v[0] = value;
 }
 function inverseMoveToFrontTransform(v: Int8Array, vLen: number): void {
-  const mtf = new Int32Array(256);
+  const mtf: Int32Array = _scratchMtf;
   for (let i = 0; i < 256; ++i) {
     mtf[i] = i;
   }
@@ -302,8 +308,8 @@ function readHuffmanCodeLengths(codeLengthCodeLengths: Int32Array, numSymbols: n
   let repeat = 0;
   let repeatCodeLen = 0;
   let space = 32768;
-  const table = new Int32Array(33);
-  const tableIdx: number = table.length - 1;
+  const table: Int32Array = _scratchHCLTable;
+  const tableIdx = 32;
   buildHuffmanTable(table, tableIdx, 5, codeLengthCodeLengths, 18);
   while (symbol < numSymbols && space > 0) {
     if (s.halfOffset > 2030) {
@@ -350,9 +356,8 @@ function readHuffmanCodeLengths(codeLengthCodeLengths: Int32Array, numSymbols: n
       if (symbol + repeatDelta > numSymbols) {
         return makeError(s, -2);
       }
-      for (let i = 0; i < repeatDelta; ++i) {
-        codeLengths[symbol++] = repeatCodeLen;
-      }
+      codeLengths.fill(repeatCodeLen, symbol, symbol + repeatDelta);
+      symbol += repeatDelta;
       if (repeatCodeLen !== 0) {
         space -= repeatDelta << (15 - repeatCodeLen);
       }
@@ -375,8 +380,9 @@ function checkDupes(s: State, symbols: Int32Array, length: number): number {
   return 0;
 }
 function readSimpleHuffmanCode(alphabetSizeMax: number, alphabetSizeLimit: number, tableGroup: Int32Array, tableIdx: number, s: State): number {
-  const codeLengths = new Int32Array(alphabetSizeLimit);
-  const symbols = new Int32Array(4);
+  const codeLengths: Int32Array = _scratchCodeLengths;
+  codeLengths.fill(0, 0, alphabetSizeLimit);
+  const symbols: Int32Array = _scratchSymbols;
   const maxBits: number = 1 + log2floor(alphabetSizeMax - 1);
   const numSymbols: number = readFewBits(s, 2) + 1;
   for (let i = 0; i < numSymbols; ++i) {
@@ -429,8 +435,10 @@ function readSimpleHuffmanCode(alphabetSizeMax: number, alphabetSizeLimit: numbe
   return buildHuffmanTable(tableGroup, tableIdx, 8, codeLengths, alphabetSizeLimit);
 }
 function readComplexHuffmanCode(alphabetSizeLimit: number, skip: number, tableGroup: Int32Array, tableIdx: number, s: State): number {
-  const codeLengths = new Int32Array(alphabetSizeLimit);
-  const codeLengthCodeLengths = new Int32Array(18);
+  const codeLengths: Int32Array = _scratchCodeLengths;
+  codeLengths.fill(0, 0, alphabetSizeLimit);
+  const codeLengthCodeLengths: Int32Array = _scratchCLCL;
+  codeLengthCodeLengths.fill(0);
   let space = 32;
   let numCodes = 0;
   for (let i: number = skip; i < 18; ++i) {
@@ -501,8 +509,8 @@ function decodeContextMap(contextMapSize: number, contextMap: Int8Array, s: Stat
   }
   const alphabetSize: number = numTrees + maxRunLengthPrefix;
   const tableSize: number = MAX_HUFFMAN_TABLE_SIZE[(alphabetSize + 31) >> 5];
-  const table = new Int32Array(tableSize + 1);
-  const tableIdx: number = table.length - 1;
+  const table: Int32Array = _scratchCtxMapTable;
+  const tableIdx: number = tableSize;
   result = readHuffmanCode(alphabetSize, alphabetSize, table, tableIdx, s);
   if (result < 0) {
     return result;
@@ -529,14 +537,11 @@ function decodeContextMap(contextMapSize: number, contextMap: Int8Array, s: Stat
         s.bitOffset -= 16;
       }
       let reps: number = (1 << code) + readFewBits(s, code);
-      while (reps !== 0) {
-        if (i >= contextMapSize) {
-          return makeError(s, -3);
-        }
-        contextMap[i] = 0;
-        i++;
-        reps--;
+      if (i + reps > contextMapSize) {
+        return makeError(s, -3);
       }
+      contextMap.fill(0, i, i + reps);
+      i += reps;
     } else {
       contextMap[i] = code - maxRunLengthPrefix;
       i++;
@@ -1077,67 +1082,136 @@ function decompress(s: State): number {
         s.j = 0;
         s.runningState = 7;
         continue;
-      case 7:
+      case 7: {
+        // Hoist hot state into locals for the literal decode inner loop.
+        // The State object has 60+ properties, making property access
+        // expensive (megamorphic). Locals give V8 register-friendly scalars.
+        let _bo: number = s.bitOffset;
+        let _ac: number = s.accumulator32;
+        let _ho: number = s.halfOffset;
+        let _pos: number = s.pos;
+        let _j: number = s.j;
+        let _lbl: number = s.literalBlockLength;
+        const _sb: Int16Array = s.shortBuffer;
+        const _ltg: Int32Array = s.literalTreeGroup;
+        const _il: number = s.insertLength;
         if (s.trivialLiteralContext !== 0) {
-          while (s.j < s.insertLength) {
-            if (s.halfOffset > 2030) {
+          let _lti: number = s.literalTreeIdx;
+          while (_j < _il) {
+            if (_ho > 2030) {
+              s.halfOffset = _ho;
               result = readMoreInput(s);
-              if (result < 0) {
-                return result;
-              }
+              if (result < 0) { return result; }
+              _ho = s.halfOffset;
             }
-            if (s.literalBlockLength === 0) {
+            if (_lbl === 0) {
+              s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
               decodeLiteralBlockSwitch(s);
+              _bo = s.bitOffset; _ac = s.accumulator32; _ho = s.halfOffset;
+              _lbl = s.literalBlockLength;
+              _lti = s.literalTreeIdx;
             }
-            s.literalBlockLength--;
-            if (s.bitOffset >= 16) {
-              s.accumulator32 = (s.shortBuffer[s.halfOffset++] << 16) | (s.accumulator32 >>> 16);
-              s.bitOffset -= 16;
+            _lbl--;
+            if (_bo >= 16) {
+              _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+              _bo -= 16;
             }
-            ringBuffer[s.pos] = readSymbol(s.literalTreeGroup, s.literalTreeIdx, s);
-            s.pos++;
-            s.j++;
-            if (s.pos >= fence) {
+            // Inline readSymbol — avoids property access round-trip through State
+            let _rsOff: number = _ltg[_lti];
+            const _rsV: number = _ac >>> _bo;
+            _rsOff += _rsV & 0xFF;
+            const _rsE0: number = _ltg[_rsOff];
+            const _rsBits: number = _rsE0 >> 16;
+            if (_rsBits <= 8) {
+              _bo += _rsBits;
+              ringBuffer[_pos] = _rsE0 & 0xFFFF;
+            } else {
+              _rsOff += _rsE0 & 0xFFFF;
+              _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
+              const _rsE1: number = _ltg[_rsOff];
+              _bo += (_rsE1 >> 16) + 8;
+              ringBuffer[_pos] = _rsE1 & 0xFFFF;
+            }
+            _pos++;
+            _j++;
+            if (_pos >= fence) {
               s.nextRunningState = 7;
               s.runningState = 12;
               break;
             }
           }
         } else {
-          let prevByte1: number = ringBuffer[(s.pos - 1) & ringBufferMask];
-          let prevByte2: number = ringBuffer[(s.pos - 2) & ringBufferMask];
-          while (s.j < s.insertLength) {
-            if (s.halfOffset > 2030) {
+          let prevByte1: number = ringBuffer[(_pos - 1) & ringBufferMask];
+          let prevByte2: number = ringBuffer[(_pos - 2) & ringBufferMask];
+          let _cms: number = s.contextMapSlice;
+          let _clo1: number = s.contextLookupOffset1;
+          let _clo2: number = s.contextLookupOffset2;
+          const _cm: Int8Array = s.contextMap;
+          while (_j < _il) {
+            if (_ho > 2030) {
+              s.halfOffset = _ho;
               result = readMoreInput(s);
-              if (result < 0) {
-                return result;
+              if (result < 0) { return result; }
+              _ho = s.halfOffset;
+            }
+            if (_lbl === 0) {
+              s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
+              s.contextMapSlice = _cms;
+              decodeLiteralBlockSwitch(s);
+              _bo = s.bitOffset; _ac = s.accumulator32; _ho = s.halfOffset;
+              _lbl = s.literalBlockLength;
+              _cms = s.contextMapSlice;
+              _clo1 = s.contextLookupOffset1;
+              _clo2 = s.contextLookupOffset2;
+            }
+            const literalContext: number = LOOKUP[_clo1 + prevByte1] | LOOKUP[_clo2 + prevByte2];
+            const literalTreeIdx: number = _cm[_cms + literalContext] & 0xFF;
+            _lbl--;
+            prevByte2 = prevByte1;
+            if (_bo >= 16) {
+              _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+              _bo -= 16;
+            }
+            // Inline readSymbol — avoids property access round-trip through State
+            {
+              let _rsOff: number = _ltg[literalTreeIdx];
+              const _rsV: number = _ac >>> _bo;
+              _rsOff += _rsV & 0xFF;
+              const _rsE0: number = _ltg[_rsOff];
+              const _rsBits: number = _rsE0 >> 16;
+              if (_rsBits <= 8) {
+                _bo += _rsBits;
+                prevByte1 = _rsE0 & 0xFFFF;
+              } else {
+                _rsOff += _rsE0 & 0xFFFF;
+                _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
+                const _rsE1: number = _ltg[_rsOff];
+                _bo += (_rsE1 >> 16) + 8;
+                prevByte1 = _rsE1 & 0xFFFF;
               }
             }
-            if (s.literalBlockLength === 0) {
-              decodeLiteralBlockSwitch(s);
-            }
-            const literalContext: number = LOOKUP[s.contextLookupOffset1 + prevByte1] | LOOKUP[s.contextLookupOffset2 + prevByte2];
-            const literalTreeIdx: number = s.contextMap[s.contextMapSlice + literalContext] & 0xFF;
-            s.literalBlockLength--;
-            prevByte2 = prevByte1;
-            if (s.bitOffset >= 16) {
-              s.accumulator32 = (s.shortBuffer[s.halfOffset++] << 16) | (s.accumulator32 >>> 16);
-              s.bitOffset -= 16;
-            }
-            prevByte1 = readSymbol(s.literalTreeGroup, literalTreeIdx, s);
-            ringBuffer[s.pos] = prevByte1;
-            s.pos++;
-            s.j++;
-            if (s.pos >= fence) {
+            ringBuffer[_pos] = prevByte1;
+            _pos++;
+            _j++;
+            if (_pos >= fence) {
               s.nextRunningState = 7;
               s.runningState = 12;
               break;
             }
           }
+          s.contextMapSlice = _cms;
         }
+        // Write back all hoisted state
+        s.bitOffset = _bo;
+        s.accumulator32 = _ac;
+        s.halfOffset = _ho;
+        s.pos = _pos;
+        s.j = _j;
+        s.literalBlockLength = _lbl;
         if (s.runningState !== 7) {
           continue;
         }
+      }
         s.metaBlockLength -= s.insertLength;
         if (s.metaBlockLength <= 0) {
           s.runningState = 4;
@@ -1210,8 +1284,11 @@ function decompress(s: State): number {
         const srcEnd: number = src + copyLength;
         const dstEnd: number = dst + copyLength;
         if ((srcEnd < ringBufferMask) && (dstEnd < ringBufferMask)) {
-          // d=4 repeating pattern, common in font table structures
-          if (s.distance === 4 && copyLength >= 8) {
+          if (s.distance === 1) {
+            // Single byte repeat — native memset
+            ringBuffer.fill(ringBuffer[src], dst, dstEnd);
+          } else if (s.distance === 4 && copyLength >= 8) {
+            // d=4 repeating pattern, common in font table structures
             ringBuffer[dst] = ringBuffer[src];
             ringBuffer[dst + 1] = ringBuffer[src + 1];
             ringBuffer[dst + 2] = ringBuffer[src + 2];
@@ -1520,9 +1597,11 @@ function nextTableBitSize(count: Int32Array, len: number, rootBits: number): num
 }
 function buildHuffmanTable(tableGroup: Int32Array, tableIdx: number, rootBits: number, codeLengths: Int32Array, codeLengthsSize: number): number {
   const tableOffset: number = tableGroup[tableIdx];
-  const sorted = new Int32Array(codeLengthsSize);
-  const count = new Int32Array(16);
-  const offset = new Int32Array(16);
+  const sorted: Int32Array = _scratchSorted;
+  const count: Int32Array = _scratchCount;
+  const offset: Int32Array = _scratchOffset;
+  count.fill(0);
+  offset.fill(0);
   for (let sym = 0; sym < codeLengthsSize; ++sym) {
     count[codeLengths[sym]]++;
   }
@@ -1539,9 +1618,7 @@ function buildHuffmanTable(tableGroup: Int32Array, tableIdx: number, rootBits: n
   let tableSize: number = 1 << tableBits;
   let totalSize: number = tableSize;
   if (offset[15] === 1) {
-    for (let k = 0; k < totalSize; ++k) {
-      tableGroup[tableOffset + k] = sorted[0];
-    }
+    tableGroup.fill(sorted[0], tableOffset, tableOffset + totalSize);
     return totalSize;
   }
   let key = 0;
@@ -1986,19 +2063,23 @@ export function brotliDecode(
     return result;
   }
   
-  // Chunked output when size unknown
+  // Chunked output with exponential growth when size unknown
   let totalOutput = 0;
+  let chunkSize = 16384;
   const chunks: Uint8Array[] = [];
+  const chunkSizes: number[] = [];
   while (true) {
-    const chunk = new Uint8Array(16384);
+    const chunk = new Uint8Array(chunkSize);
     chunks.push(chunk);
+    chunkSizes.push(chunkSize);
     s.output = chunk;
     s.outputOffset = 0;
-    s.outputLength = 16384;
+    s.outputLength = chunkSize;
     s.outputUsed = 0;
     decompress(s);
     totalOutput += s.outputUsed;
-    if (s.outputUsed < 16384) break;
+    if (s.outputUsed < chunkSize) break;
+    if (chunkSize < 4194304) chunkSize *= 2; // cap at 4MB
   }
   close(s);
   closeInput(s);
@@ -2006,9 +2087,10 @@ export function brotliDecode(
   let offset = 0;
   for (let i = 0; i < chunks.length; ++i) {
     const chunk: Uint8Array = chunks[i];
-    const end: number = Math.min(totalOutput, offset + 16384);
+    const sz: number = chunkSizes[i];
+    const end: number = Math.min(totalOutput, offset + sz);
     const len: number = end - offset;
-    if (len < 16384) {
+    if (len < sz) {
       result.set(chunk.subarray(0, len), offset);
     } else {
       result.set(chunk, offset);
