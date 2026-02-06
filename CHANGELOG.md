@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.0.4 - 2026-02-06
+
+### Performance
+
+- Decoder
+  - Hoist State properties into locals in literal decode loop (reduces megamorphic property access)
+  - Reuse scratch buffers for Huffman table construction (reduces GC pressure)
+  - Scratch table for `decodeContextMap`
+  - `distance=1` fill and `distance=4` doubling copy in copy loop
+  - `TypedArray.fill()` for RLE zeros, repeat deltas, and single-symbol Huffman tables
+  - `copyWithin` for move-to-front transform
+  - Minimize state write-backs before `readMoreInput`
+  - Exponential output buffer growth for unknown-size decodes
+
 ## 0.0.3 - 2026-02-03
 
 ### Fixed
