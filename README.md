@@ -1,5 +1,7 @@
 # brotli-lib
 
+[![npm version](https://img.shields.io/npm/v/brotli-lib)](https://www.npmjs.com/package/brotli-lib)
+
 TypeScript Brotli encoder and decoder
 
 ## Install

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.6 - 2026-02-07
+
+### Performance
+
+- Decoder
+  - Command pipeline fusion: fuse command decode, literal loop, and copy loop into a single tight `while` loop, eliminating switch dispatches and intermediate state write-backs
+  - Generalized doubling copy: extend optimized `copyWithin` doubling for all small distances (d ≤ 8)
+  - Context-tree-base table: fuse context map and literal tree group lookups into a single 64-entry precomputed table, replacing 4 dependent array loads with 1
+
 ## 0.0.5 - 2026-02-06
 
 ### Performance

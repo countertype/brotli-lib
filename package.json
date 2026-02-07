@@ -1,6 +1,6 @@
 {
   "name": "brotli-lib",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "TypeScript Brotli encoder and decoder",
   "type": "module",
   "sideEffects": false,
