@@ -1111,29 +1111,34 @@ function decompress(s: State): number {
               _lbl = s.literalBlockLength;
               _lti = s.literalTreeIdx;
             }
-            _lbl--;
-            if (_bo >= 16) {
-              _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
-              _bo -= 16;
+            // Batched inner loop: compute how many literals we can decode
+            // without re-checking input refill, block switch, or fence guards.
+            const batchLen: number = Math.min(_il - _j, _lbl, fence - _pos, 2031 - _ho);
+            const batchEnd: number = _j + batchLen;
+            _lbl -= batchLen;
+            while (_j < batchEnd) {
+              if (_bo >= 16) {
+                _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+                _bo -= 16;
+              }
+              let _rsOff: number = _ltg[_lti];
+              const _rsV: number = _ac >>> _bo;
+              _rsOff += _rsV & 0xFF;
+              const _rsE0: number = _ltg[_rsOff];
+              const _rsBits: number = _rsE0 >> 16;
+              if (_rsBits <= 8) {
+                _bo += _rsBits;
+                ringBuffer[_pos] = _rsE0 & 0xFFFF;
+              } else {
+                _rsOff += _rsE0 & 0xFFFF;
+                _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
+                const _rsE1: number = _ltg[_rsOff];
+                _bo += (_rsE1 >> 16) + 8;
+                ringBuffer[_pos] = _rsE1 & 0xFFFF;
+              }
+              _pos++;
+              _j++;
             }
-            // Inline readSymbol — avoids property access round-trip through State
-            let _rsOff: number = _ltg[_lti];
-            const _rsV: number = _ac >>> _bo;
-            _rsOff += _rsV & 0xFF;
-            const _rsE0: number = _ltg[_rsOff];
-            const _rsBits: number = _rsE0 >> 16;
-            if (_rsBits <= 8) {
-              _bo += _rsBits;
-              ringBuffer[_pos] = _rsE0 & 0xFFFF;
-            } else {
-              _rsOff += _rsE0 & 0xFFFF;
-              _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
-              const _rsE1: number = _ltg[_rsOff];
-              _bo += (_rsE1 >> 16) + 8;
-              ringBuffer[_pos] = _rsE1 & 0xFFFF;
-            }
-            _pos++;
-            _j++;
             if (_pos >= fence) {
               s.nextRunningState = 7;
               s.runningState = 12;
@@ -1164,35 +1169,39 @@ function decompress(s: State): number {
               _clo1 = s.contextLookupOffset1;
               _clo2 = s.contextLookupOffset2;
             }
-            const literalContext: number = LOOKUP[_clo1 + prevByte1] | LOOKUP[_clo2 + prevByte2];
-            const literalTreeIdx: number = _cm[_cms + literalContext] & 0xFF;
-            _lbl--;
-            prevByte2 = prevByte1;
-            if (_bo >= 16) {
-              _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
-              _bo -= 16;
-            }
-            // Inline readSymbol — avoids property access round-trip through State
-            {
-              let _rsOff: number = _ltg[literalTreeIdx];
-              const _rsV: number = _ac >>> _bo;
-              _rsOff += _rsV & 0xFF;
-              const _rsE0: number = _ltg[_rsOff];
-              const _rsBits: number = _rsE0 >> 16;
-              if (_rsBits <= 8) {
-                _bo += _rsBits;
-                prevByte1 = _rsE0 & 0xFFFF;
-              } else {
-                _rsOff += _rsE0 & 0xFFFF;
-                _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
-                const _rsE1: number = _ltg[_rsOff];
-                _bo += (_rsE1 >> 16) + 8;
-                prevByte1 = _rsE1 & 0xFFFF;
+            // Batched inner loop (non-trivial context path)
+            const batchLen: number = Math.min(_il - _j, _lbl, fence - _pos, 2031 - _ho);
+            const batchEnd: number = _j + batchLen;
+            _lbl -= batchLen;
+            while (_j < batchEnd) {
+              const literalContext: number = LOOKUP[_clo1 + prevByte1] | LOOKUP[_clo2 + prevByte2];
+              const literalTreeIdx: number = _cm[_cms + literalContext] & 0xFF;
+              prevByte2 = prevByte1;
+              if (_bo >= 16) {
+                _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+                _bo -= 16;
               }
+              {
+                let _rsOff: number = _ltg[literalTreeIdx];
+                const _rsV: number = _ac >>> _bo;
+                _rsOff += _rsV & 0xFF;
+                const _rsE0: number = _ltg[_rsOff];
+                const _rsBits: number = _rsE0 >> 16;
+                if (_rsBits <= 8) {
+                  _bo += _rsBits;
+                  prevByte1 = _rsE0 & 0xFFFF;
+                } else {
+                  _rsOff += _rsE0 & 0xFFFF;
+                  _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
+                  const _rsE1: number = _ltg[_rsOff];
+                  _bo += (_rsE1 >> 16) + 8;
+                  prevByte1 = _rsE1 & 0xFFFF;
+                }
+              }
+              ringBuffer[_pos] = prevByte1;
+              _pos++;
+              _j++;
             }
-            ringBuffer[_pos] = prevByte1;
-            _pos++;
-            _j++;
             if (_pos >= fence) {
               s.nextRunningState = 7;
               s.runningState = 12;
@@ -1711,7 +1720,15 @@ function initBitReader(s: State): number {
   s.byteBuffer = new Int8Array(4160);
   s.byteBuffer16 = new Uint16Array(s.byteBuffer.buffer, s.byteBuffer.byteOffset, 2080);
   s.accumulator32 = 0;
-  s.shortBuffer = new Int16Array(2080);
+  if (IS_LITTLE_ENDIAN) {
+    // Share underlying ArrayBuffer: shortBuffer views the same bytes as byteBuffer.
+    // On LE, Int16Array and Uint16Array views read identical bit patterns,
+    // so bytesToNibbles becomes a no-op — data written to byteBuffer is
+    // immediately visible through shortBuffer without copying.
+    s.shortBuffer = new Int16Array(s.byteBuffer.buffer, s.byteBuffer.byteOffset, 2080);
+  } else {
+    s.shortBuffer = new Int16Array(2080);
+  }
   s.bitOffset = 32;
   s.halfOffset = 2048;
   s.endOfStreamReached = 0;
@@ -1809,12 +1826,9 @@ function copyRawBytes(s: State, data: Uint8Array | Int8Array, offset: number, le
   return 0;
 }
 function bytesToNibbles(s: State, byteLen: number): void {
+  if (IS_LITTLE_ENDIAN) return; // shortBuffer shares byteBuffer's ArrayBuffer
   const halfLen: number = byteLen >> 1;
   const shortBuffer: Int16Array = s.shortBuffer;
-  if (IS_LITTLE_ENDIAN) {
-    shortBuffer.set(s.byteBuffer16.subarray(0, halfLen));
-    return;
-  }
   const byteBuffer: Int8Array = s.byteBuffer;
   for (let i = 0; i < halfLen; ++i) {
     shortBuffer[i] = (byteBuffer[i * 2] & 0xFF) | ((byteBuffer[(i * 2) + 1] & 0xFF) << 8);
@@ -2034,6 +2048,50 @@ function makeError(s: State, code: number): number {
 /* GENERATED CODE END */
 
 type ByteBuffer = Int8Array;
+
+/**
+ * Peek at brotli header to determine decoded size without allocating State/BrotliBitReader.
+ * Returns the decoded size for single-metablock streams, or -1 if unknown.
+ * Zero-allocation: reads bits directly from raw bytes.
+ */
+export function peekDecodedSize(bytes: Uint8Array | Int8Array): number {
+  let bitPos = 0;
+  const readBits = (n: number): number => {
+    let val = 0;
+    for (let i = 0; i < n; i++) {
+      val |= ((bytes[bitPos >> 3] >> (bitPos & 7)) & 1) << i;
+      bitPos++;
+    }
+    return val;
+  };
+  // Skip window bits
+  if (readBits(1) !== 0) {
+    const n = readBits(3);
+    if (n === 0) {
+      const m = readBits(3);
+      if (m === 1) {
+        // Large window extension
+        if (readBits(1) !== 0) return -1;
+        readBits(6);
+      }
+    }
+  }
+  // Metablock header
+  const inputEnd = readBits(1);
+  if (inputEnd !== 0 && readBits(1) !== 0) {
+    return 0; // empty last block
+  }
+  const sizeNibbles = readBits(2) + 4;
+  if (sizeNibbles === 7) {
+    return -1; // metadata block
+  }
+  let metaBlockLength = 0;
+  for (let i = 0; i < sizeNibbles; i++) {
+    metaBlockLength |= readBits(4) << (i * 4);
+  }
+  metaBlockLength++;
+  return inputEnd !== 0 ? metaBlockLength : -1;
+}
 
 /**
  * Decodes brotli stream.

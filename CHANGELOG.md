@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.5 - 2026-02-06
+
+### Performance
+
+- Decoder
+  - Zero-allocation `peekDecodedSize` header peek (eliminates redundant `BrotliBitReader` + `BrotliInput` allocation per decode)
+  - Batched literal decode loops: compute batch size to skip per-iteration guard checks for input refill, block switch, and fence
+  - Eliminate `bytesToNibbles` memcpy on little-endian by sharing `ArrayBuffer` between `byteBuffer` and `shortBuffer`
+
 ## 0.0.4 - 2026-02-06
 
 ### Performance
