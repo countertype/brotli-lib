@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.7 - 2026-02-11
+
+### Performance
+
+- Encoder
+  - Eliminate redundant hash stores and reduce store frequency in backward references (Q1 ~40% faster)
+  - Cache `SimpleHasher` across encode calls (avoids 512KB alloc per encode)
+  - Reuse `ZopfliNode[]` and pre-allocate arrays across Zopfli DP iterations (Q11 ~20% faster)
+  - Remove unnecessary `BigInt` from `encodeMlen`
+
 ## 0.0.6 - 2026-02-07
 
 ### Performance
