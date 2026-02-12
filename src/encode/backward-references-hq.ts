@@ -50,6 +50,17 @@ export function createZopfliNodes(length: number): ZopfliNode[] {
   return nodes
 }
 
+function resetZopfliNodes(nodes: ZopfliNode[]): void {
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i]
+    n.length = 1
+    n.distance = 0
+    n.dcodeInsertLength = 0
+    n.cost = INFINITY_COST
+    n.shortcut = 0
+  }
+}
+
 // Zopfli node accessors
 function zopfliNodeCopyLength(node: ZopfliNode): number {
   return node.length & 0x1FFFFFF
@@ -222,6 +233,9 @@ function computeDistanceCache(
   }
 }
 
+// Reusable scratch buffer for evaluateNode
+const _evalDistCache = new Int32Array(4)
+
 function evaluateNode(
   blockStart: number,
   pos: number,
@@ -238,14 +252,13 @@ function evaluateNode(
   )
   
   if (nodeCost <= model.getLiteralCosts(0, pos)) {
-    const distanceCache = new Int32Array(4)
-    computeDistanceCache(pos, startingDistCache, nodes, distanceCache)
+    computeDistanceCache(pos, startingDistCache, nodes, _evalDistCache)
     
     queue.push({
       pos,
       cost: nodeCost,
       costdiff: nodeCost - model.getLiteralCosts(0, pos),
-      distanceCache,
+      distanceCache: _evalDistCache,
     })
   }
 }
@@ -485,8 +498,9 @@ export function createHqZopfliBackwardReferences(
   const maxZopfliLenVal = maxZopfliLen(quality)
   
   // First pass: collect all matches
-  const allMatches: BackwardMatch[][] = []
-  const numMatchesPerPos: number[] = []
+  const allMatches: BackwardMatch[][] = new Array(numBytes)
+  const numMatchesPerPos: number[] = new Array(numBytes)
+  let matchIdx = 0
   
   for (let i = 0; i + 3 < numBytes; i++) {
     const pos = position + i
@@ -505,27 +519,29 @@ export function createHqZopfliBackwardReferences(
       const longestMatch = matches[matches.length - 1]
       if (backwardMatchLength(longestMatch) > maxZopfliLenVal) {
         const skip = backwardMatchLength(longestMatch) - 1
-        allMatches.push([longestMatch])
-        numMatchesPerPos.push(1)
+        allMatches[matchIdx] = [longestMatch]
+        numMatchesPerPos[matchIdx++] = 1
         
         // Skip positions
+        const emptyArr: BackwardMatch[] = []
         for (let j = 0; j < skip && i + j + 1 < numBytes; j++) {
-          allMatches.push([])
-          numMatchesPerPos.push(0)
+          allMatches[matchIdx] = emptyArr
+          numMatchesPerPos[matchIdx++] = 0
         }
         i += skip
         continue
       }
     }
     
-    allMatches.push(matches)
-    numMatchesPerPos.push(matches.length)
+    allMatches[matchIdx] = matches
+    numMatchesPerPos[matchIdx++] = matches.length
   }
   
   // Pad to full length
-  while (allMatches.length < numBytes) {
-    allMatches.push([])
-    numMatchesPerPos.push(0)
+  const emptyArr: BackwardMatch[] = []
+  while (matchIdx < numBytes) {
+    allMatches[matchIdx] = emptyArr
+    numMatchesPerPos[matchIdx++] = 0
   }
   
   // Save original state for second pass
@@ -540,9 +556,12 @@ export function createHqZopfliBackwardReferences(
   let numLiterals = 0
   let finalLastInsertLen = lastInsertLen
   
+  // Allocate nodes once, reuse across iterations
+  const nodes = createZopfliNodes(numBytes + 1)
+  
   // Two iterations: first with literal costs, then with actual command costs
   for (let iteration = 0; iteration < 2; iteration++) {
-    const nodes = createZopfliNodes(numBytes + 1)
+    if (iteration > 0) resetZopfliNodes(nodes)
     nodes[0].length = 0
     nodes[0].cost = 0
     

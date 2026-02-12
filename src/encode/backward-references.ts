@@ -68,7 +68,7 @@ export function createBackwardReferences(
       // Validate the match
       if (distance > pos) {
         // Invalid: distance can't be greater than current position
-        hasher.store(ringbuffer, ringbufferMask, pos)
+        // Note: findLongestMatch already stored pos in the hash table
         insertLen++
         pos++
         continue
@@ -98,16 +98,24 @@ export function createBackwardReferences(
       }
       
       // Store matched positions in hasher
+      // For low qualities, store less aggressively for speed (slight compression loss)
       const storeEnd = Math.min(pos + matchLen, posEnd - 4)
-      for (let i = pos + 1; i < storeEnd; i++) {
-        hasher.store(ringbuffer, ringbufferMask, i)
+      if (_quality <= 2) {
+        // Store every 4th position — big speedup for quality 1-2
+        for (let i = pos + 1; i < storeEnd; i += 4) {
+          hasher.store(ringbuffer, ringbufferMask, i)
+        }
+      } else {
+        for (let i = pos + 1; i < storeEnd; i++) {
+          hasher.store(ringbuffer, ringbufferMask, i)
+        }
       }
       
       pos += matchLen
       insertLen = 0
     } else {
       // No good match - emit literal
-      hasher.store(ringbuffer, ringbufferMask, pos)
+      // Note: findLongestMatch already stored pos in the hash table
       insertLen++
       pos++
     }

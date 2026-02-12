@@ -126,7 +126,25 @@ export class SimpleHasher {
   }
 }
 
+// Cache hashers to avoid re-allocating large typed arrays
+let _cachedHasher17: SimpleHasher | null = null
+let _cachedHasher16: SimpleHasher | null = null
+
 export function createSimpleHasher(quality: number, lgwin: number): SimpleHasher {
   const bucketBits = quality === 2 ? Q2_BUCKET_BITS : Q3_BUCKET_BITS
-  return new SimpleHasher(bucketBits, lgwin)
+  if (bucketBits === Q3_BUCKET_BITS) {
+    if (_cachedHasher17 === null) {
+      _cachedHasher17 = new SimpleHasher(bucketBits, lgwin)
+    } else {
+      _cachedHasher17.reset()
+    }
+    return _cachedHasher17
+  } else {
+    if (_cachedHasher16 === null) {
+      _cachedHasher16 = new SimpleHasher(bucketBits, lgwin)
+    } else {
+      _cachedHasher16.reset()
+    }
+    return _cachedHasher16
+  }
 }

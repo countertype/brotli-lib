@@ -219,12 +219,12 @@ export function storeBlockSwitch(
   writer.writeBits(lenNExtra, lenExtra)
 }
 
-export function encodeMlen(length: number): { bits: bigint; numBits: number; nibblesBits: number } {
+export function encodeMlen(length: number): { bits: number; numBits: number; nibblesBits: number } {
   const lg = length === 1 ? 1 : log2FloorNonZero(length - 1) + 1
   const mnibbles = Math.floor((lg < 16 ? 16 : lg + 3) / 4)
   
   return {
-    bits: BigInt(length - 1),
+    bits: length - 1,
     numBits: mnibbles * 4,
     nibblesBits: mnibbles - 4,
   }
@@ -246,7 +246,7 @@ export function storeCompressedMetaBlockHeader(
   // MLEN
   const { bits, numBits, nibblesBits } = encodeMlen(length)
   writer.writeBits(2, nibblesBits)
-  writer.writeBitsLong(numBits, bits)
+  writer.writeBits(numBits, bits)
   
   // ISUNCOMPRESSED (only for non-last blocks)
   if (!isLast) {
@@ -264,7 +264,7 @@ export function storeUncompressedMetaBlockHeader(
   // MLEN
   const { bits, numBits, nibblesBits } = encodeMlen(length)
   writer.writeBits(2, nibblesBits)
-  writer.writeBitsLong(numBits, bits)
+  writer.writeBits(numBits, bits)
   
   // ISUNCOMPRESSED = 1
   writer.writeBits(1, 1)
