@@ -17,6 +17,11 @@
   - Zero-allocation `peekDecodedSize` header peek (eliminates redundant `BrotliBitReader` + `BrotliInput` allocation per decode)
   - Batched literal decode loops: compute batch size to skip per-iteration guard checks for input refill, block switch, and fence
   - Eliminate `bytesToNibbles` memcpy on little-endian by sharing `ArrayBuffer` between `byteBuffer` and `shortBuffer`
+  - Merge command decode (case 4) into literal loop (case 7): shared hoisted locals across both, eliminates switch dispatch
+  - Inline `readSymbol` + `readFewBits`/`readManyBits` in command decode (eliminates function call overhead + State property access for ~30K calls per font)
+  - Command pipeline fusion: fuse case 4 (command), case 7 (literal+distance), and case 8 (copy) into single tight `commandLoop` with local `_phase` control flow, eliminating 2 switch dispatches and ~30 property write-backs per command cycle
+  - Generalized doubling copy for small distances (d <= 8): seed d bytes then `copyWithin` doubling
+  - Context-tree-base table: pre-build 64-entry `context → Huffman tree base offset` lookup at each literal block boundary, fusing context map + tree group indirection into a single array access per literal (~20% faster than Google's JS decoder)
 
 ## 0.0.4 - 2026-02-06
 

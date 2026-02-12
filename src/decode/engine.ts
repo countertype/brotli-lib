@@ -588,6 +588,15 @@ function decodeLiteralBlockSwitch(s: State): void {
   s.contextLookupOffset1 = contextMode << 9;
   s.contextLookupOffset2 = s.contextLookupOffset1 + 256;
 }
+function buildContextTreeBase(s: State): void {
+  const ctb: Int32Array = s.contextTreeBase;
+  const cms: number = s.contextMapSlice;
+  const cm: Int8Array = s.contextMap;
+  const ltg: Int32Array = s.literalTreeGroup;
+  for (let ctx = 0; ctx < 64; ctx++) {
+    ctb[ctx] = ltg[cm[cms + ctx] & 0xFF];
+  }
+}
 function decodeCommandBlockSwitch(s: State): void {
   s.commandBlockLength = decodeBlockTypeAndLength(s, 1, s.numCommandBlockTypes);
   s.commandTreeIdx = s.rings[7];
@@ -815,6 +824,7 @@ function readMetablockHuffmanCodesAndContextMaps(s: State): number {
   s.distContextMapSlice = 0;
   s.contextLookupOffset1 = s.contextModes[0] * 512;
   s.contextLookupOffset2 = s.contextLookupOffset1 + 256;
+  buildContextTreeBase(s);
   s.literalTreeIdx = 0;
   s.commandTreeIdx = 0;
   s.rings[4] = 1;
@@ -1033,6 +1043,9 @@ function decompress(s: State): number {
           return result;
         }
         fence = calculateFence(s);
+        if (s.isEager === 0 && s.pos + s.metaBlockLength <= s.ringBufferSize) {
+          fence = 0x7FFFFFFF;
+        }
         ringBufferMask = s.ringBufferSize - 1;
         ringBuffer = s.ringBuffer;
         continue;
@@ -1044,301 +1057,385 @@ function decompress(s: State): number {
         s.runningState = 4;
         continue;
       case 4:
-        if (s.metaBlockLength <= 0) {
-          s.runningState = 2;
-          continue;
-        }
-        if (s.halfOffset > 2030) {
-          result = readMoreInput(s);
-          if (result < 0) {
-            return result;
-          }
-        }
-        if (s.commandBlockLength === 0) {
-          decodeCommandBlockSwitch(s);
-        }
-        s.commandBlockLength--;
-        if (s.bitOffset >= 16) {
-          s.accumulator32 = (s.shortBuffer[s.halfOffset++] << 16) | (s.accumulator32 >>> 16);
-          s.bitOffset -= 16;
-        }
-        const cmdCode: number = readSymbol(s.commandTreeGroup, s.commandTreeIdx, s) << 2;
-        const insertAndCopyExtraBits: number = CMD_LOOKUP[cmdCode];
-        const insertLengthOffset: number = CMD_LOOKUP[cmdCode + 1];
-        const copyLengthOffset: number = CMD_LOOKUP[cmdCode + 2];
-        s.distanceCode = CMD_LOOKUP[cmdCode + 3];
-        if (s.bitOffset >= 16) {
-          s.accumulator32 = (s.shortBuffer[s.halfOffset++] << 16) | (s.accumulator32 >>> 16);
-          s.bitOffset -= 16;
-        }
-        const insertLengthExtraBits: number = insertAndCopyExtraBits & 0xFF;
-        s.insertLength = insertLengthOffset + ((insertLengthExtraBits <= 16) ? readFewBits(s, insertLengthExtraBits) : readManyBits(s, insertLengthExtraBits));
-        if (s.bitOffset >= 16) {
-          s.accumulator32 = (s.shortBuffer[s.halfOffset++] << 16) | (s.accumulator32 >>> 16);
-          s.bitOffset -= 16;
-        }
-        const copyLengthExtraBits: number = insertAndCopyExtraBits >> 8;
-        s.copyLength = copyLengthOffset + ((copyLengthExtraBits <= 16) ? readFewBits(s, copyLengthExtraBits) : readManyBits(s, copyLengthExtraBits));
-        s.j = 0;
-        s.runningState = 7;
-        continue;
-      case 7: {
-        // Hoist hot state into locals for the literal decode inner loop.
-        // The State object has 60+ properties, making property access
-        // expensive (megamorphic). Locals give V8 register-friendly scalars.
+      case 7:
+      case 8: {
+        // Fused command pipeline: command decode → literal loop → distance
+        // decode → copy loop. Tight inner commandLoop eliminates switch
+        // dispatch between phases. Hoisted locals shared across all phases.
         let _bo: number = s.bitOffset;
         let _ac: number = s.accumulator32;
         let _ho: number = s.halfOffset;
-        let _pos: number = s.pos;
-        let _j: number = s.j;
-        let _lbl: number = s.literalBlockLength;
         const _sb: Int16Array = s.shortBuffer;
-        const _ltg: Int32Array = s.literalTreeGroup;
-        const _il: number = s.insertLength;
-        if (s.trivialLiteralContext !== 0) {
-          let _lti: number = s.literalTreeIdx;
-          while (_j < _il) {
-            if (_ho > 2030) {
-              s.halfOffset = _ho;
-              result = readMoreInput(s);
-              if (result < 0) { return result; }
-              _ho = s.halfOffset;
-            }
-            if (_lbl === 0) {
-              s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
-              decodeLiteralBlockSwitch(s);
-              _bo = s.bitOffset; _ac = s.accumulator32; _ho = s.halfOffset;
-              _lbl = s.literalBlockLength;
-              _lti = s.literalTreeIdx;
-            }
-            // Batched inner loop: compute how many literals we can decode
-            // without re-checking input refill, block switch, or fence guards.
-            const batchLen: number = Math.min(_il - _j, _lbl, fence - _pos, 2031 - _ho);
-            const batchEnd: number = _j + batchLen;
-            _lbl -= batchLen;
-            while (_j < batchEnd) {
-              if (_bo >= 16) {
-                _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
-                _bo -= 16;
-              }
-              let _rsOff: number = _ltg[_lti];
-              const _rsV: number = _ac >>> _bo;
-              _rsOff += _rsV & 0xFF;
-              const _rsE0: number = _ltg[_rsOff];
-              const _rsBits: number = _rsE0 >> 16;
-              if (_rsBits <= 8) {
-                _bo += _rsBits;
-                ringBuffer[_pos] = _rsE0 & 0xFFFF;
-              } else {
-                _rsOff += _rsE0 & 0xFFFF;
-                _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
-                const _rsE1: number = _ltg[_rsOff];
-                _bo += (_rsE1 >> 16) + 8;
-                ringBuffer[_pos] = _rsE1 & 0xFFFF;
-              }
-              _pos++;
-              _j++;
-            }
-            if (_pos >= fence) {
-              s.nextRunningState = 7;
-              s.runningState = 12;
-              break;
+        let _pos: number = s.pos;
+        let _mbl: number = s.metaBlockLength;
+        let _phase: number = s.runningState;
+        const _ctg: Int32Array = s.commandTreeGroup;
+        const _dtg: Int32Array = s.distanceTreeGroup;
+        const _dcm: Int8Array = s.distContextMap;
+        const _dExtra: Int8Array = s.distExtraBits;
+        const _dOffset: Int32Array = s.distOffset;
+        let _dcms: number = s.distContextMapSlice;
+        commandLoop: while (true) {
+        // === Phase 4: Command decode ===
+        if (_phase === 4) {
+          if (_mbl <= 0) {
+            s.runningState = 2;
+            break commandLoop;
+          }
+          if (_ho > 2030) {
+            s.halfOffset = _ho;
+            result = readMoreInput(s);
+            if (result < 0) { s.bitOffset = _bo; s.accumulator32 = _ac; s.pos = _pos; s.metaBlockLength = _mbl; return result; }
+            _ho = s.halfOffset;
+          }
+          if (s.commandBlockLength === 0) {
+            s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
+            decodeCommandBlockSwitch(s);
+            _bo = s.bitOffset; _ac = s.accumulator32; _ho = s.halfOffset;
+          }
+          s.commandBlockLength--;
+          if (_bo >= 16) { _ac = (_sb[_ho++] << 16) | (_ac >>> 16); _bo -= 16; }
+          // Inline readSymbol for command code
+          let cmdSym: number;
+          {
+            let _off: number = _ctg[s.commandTreeIdx];
+            const _v: number = _ac >>> _bo;
+            _off += _v & 0xFF;
+            const _e0: number = _ctg[_off];
+            const _bits: number = _e0 >> 16;
+            if (_bits <= 8) {
+              _bo += _bits;
+              cmdSym = _e0 & 0xFFFF;
+            } else {
+              _off += _e0 & 0xFFFF;
+                _off += (_v & ((1 << _bits) - 1)) >>> 8;
+              const _e1: number = _ctg[_off];
+              _bo += (_e1 >> 16) + 8;
+              cmdSym = _e1 & 0xFFFF;
             }
           }
-        } else {
-          let prevByte1: number = ringBuffer[(_pos - 1) & ringBufferMask];
-          let prevByte2: number = ringBuffer[(_pos - 2) & ringBufferMask];
-          let _cms: number = s.contextMapSlice;
-          let _clo1: number = s.contextLookupOffset1;
-          let _clo2: number = s.contextLookupOffset2;
-          const _cm: Int8Array = s.contextMap;
-          while (_j < _il) {
-            if (_ho > 2030) {
-              s.halfOffset = _ho;
-              result = readMoreInput(s);
-              if (result < 0) { return result; }
-              _ho = s.halfOffset;
-            }
-            if (_lbl === 0) {
-              s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
-              s.contextMapSlice = _cms;
-              decodeLiteralBlockSwitch(s);
-              _bo = s.bitOffset; _ac = s.accumulator32; _ho = s.halfOffset;
-              _lbl = s.literalBlockLength;
-              _cms = s.contextMapSlice;
-              _clo1 = s.contextLookupOffset1;
-              _clo2 = s.contextLookupOffset2;
-            }
-            // Batched inner loop (non-trivial context path)
-            const batchLen: number = Math.min(_il - _j, _lbl, fence - _pos, 2031 - _ho);
-            const batchEnd: number = _j + batchLen;
-            _lbl -= batchLen;
-            while (_j < batchEnd) {
-              const literalContext: number = LOOKUP[_clo1 + prevByte1] | LOOKUP[_clo2 + prevByte2];
-              const literalTreeIdx: number = _cm[_cms + literalContext] & 0xFF;
-              prevByte2 = prevByte1;
-              if (_bo >= 16) {
-                _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
-                _bo -= 16;
+          const cmdCode: number = cmdSym << 2;
+          const insertAndCopyExtraBits: number = CMD_LOOKUP[cmdCode];
+          const insertLengthOffset: number = CMD_LOOKUP[cmdCode + 1];
+          const copyLengthOffset: number = CMD_LOOKUP[cmdCode + 2];
+          s.distanceCode = CMD_LOOKUP[cmdCode + 3];
+          if (_bo >= 16) { _ac = (_sb[_ho++] << 16) | (_ac >>> 16); _bo -= 16; }
+          // Inline readFewBits/readManyBits for insert length
+          const insertLengthExtraBits: number = insertAndCopyExtraBits & 0xFF;
+          if (insertLengthExtraBits <= 16) {
+            s.insertLength = insertLengthOffset + ((_ac >>> _bo) & ((1 << insertLengthExtraBits) - 1));
+            _bo += insertLengthExtraBits;
+          } else {
+            const iLow: number = (_ac >>> _bo) & 0xFFFF;
+            _bo += 16;
+            _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+            _bo -= 16;
+            s.insertLength = insertLengthOffset + (iLow | (((_ac >>> _bo) & ((1 << (insertLengthExtraBits - 16)) - 1)) << 16));
+            _bo += insertLengthExtraBits - 16;
+          }
+          if (_bo >= 16) { _ac = (_sb[_ho++] << 16) | (_ac >>> 16); _bo -= 16; }
+          // Inline readFewBits/readManyBits for copy length
+          const copyLengthExtraBits: number = insertAndCopyExtraBits >> 8;
+          if (copyLengthExtraBits <= 16) {
+            s.copyLength = copyLengthOffset + ((_ac >>> _bo) & ((1 << copyLengthExtraBits) - 1));
+            _bo += copyLengthExtraBits;
+          } else {
+            const cLow: number = (_ac >>> _bo) & 0xFFFF;
+            _bo += 16;
+            _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+            _bo -= 16;
+            s.copyLength = copyLengthOffset + (cLow | (((_ac >>> _bo) & ((1 << (copyLengthExtraBits - 16)) - 1)) << 16));
+            _bo += copyLengthExtraBits - 16;
+          }
+          s.j = 0;
+          _phase = 7;
+        }
+        // === Phase 7: Literal decode loop + distance decode ===
+        if (_phase <= 7) {
+          let _j: number = s.j;
+          let _lbl: number = s.literalBlockLength;
+          const _ltg: Int32Array = s.literalTreeGroup;
+          const _il: number = s.insertLength;
+          if (s.trivialLiteralContext !== 0) {
+            let _lti: number = s.literalTreeIdx;
+            while (_j < _il) {
+              if (_ho > 2030) {
+                s.halfOffset = _ho;
+                result = readMoreInput(s);
+                if (result < 0) { s.bitOffset = _bo; s.accumulator32 = _ac; s.pos = _pos; s.metaBlockLength = _mbl; return result; }
+                _ho = s.halfOffset;
               }
-              {
-                let _rsOff: number = _ltg[literalTreeIdx];
+              if (_lbl === 0) {
+                s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
+                decodeLiteralBlockSwitch(s);
+                _bo = s.bitOffset; _ac = s.accumulator32; _ho = s.halfOffset;
+                _lbl = s.literalBlockLength;
+                _lti = s.literalTreeIdx;
+              }
+              const batchLen: number = Math.min(_il - _j, _lbl, fence - _pos, 2031 - _ho);
+              const batchEnd: number = _j + batchLen;
+              _lbl -= batchLen;
+              while (_j < batchEnd) {
+                if (_bo >= 16) {
+                  _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+                  _bo -= 16;
+                }
+                let _rsOff: number = _ltg[_lti];
                 const _rsV: number = _ac >>> _bo;
                 _rsOff += _rsV & 0xFF;
                 const _rsE0: number = _ltg[_rsOff];
                 const _rsBits: number = _rsE0 >> 16;
                 if (_rsBits <= 8) {
                   _bo += _rsBits;
-                  prevByte1 = _rsE0 & 0xFFFF;
+                  ringBuffer[_pos] = _rsE0 & 0xFFFF;
                 } else {
                   _rsOff += _rsE0 & 0xFFFF;
                   _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
                   const _rsE1: number = _ltg[_rsOff];
                   _bo += (_rsE1 >> 16) + 8;
-                  prevByte1 = _rsE1 & 0xFFFF;
+                  ringBuffer[_pos] = _rsE1 & 0xFFFF;
+                }
+                _pos++;
+                _j++;
+              }
+              if (_pos >= fence) {
+                s.nextRunningState = 7;
+                s.runningState = 12;
+                break;
+              }
+            }
+          } else {
+            let prevByte1: number = ringBuffer[(_pos - 1) & ringBufferMask];
+            let prevByte2: number = ringBuffer[(_pos - 2) & ringBufferMask];
+            let _cms: number = s.contextMapSlice;
+            let _clo1: number = s.contextLookupOffset1;
+            let _clo2: number = s.contextLookupOffset2;
+            let _ctb: Int32Array = s.contextTreeBase;
+            while (_j < _il) {
+              if (_ho > 2030) {
+                s.halfOffset = _ho;
+                result = readMoreInput(s);
+                if (result < 0) { s.bitOffset = _bo; s.accumulator32 = _ac; s.pos = _pos; s.metaBlockLength = _mbl; return result; }
+                _ho = s.halfOffset;
+              }
+              if (_lbl === 0) {
+                s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
+                s.contextMapSlice = _cms;
+                decodeLiteralBlockSwitch(s);
+                _bo = s.bitOffset; _ac = s.accumulator32; _ho = s.halfOffset;
+                _lbl = s.literalBlockLength;
+                _cms = s.contextMapSlice;
+                _clo1 = s.contextLookupOffset1;
+                _clo2 = s.contextLookupOffset2;
+                buildContextTreeBase(s);
+                _ctb = s.contextTreeBase;
+              }
+              const batchLen: number = Math.min(_il - _j, _lbl, fence - _pos, 2031 - _ho);
+              const batchEnd: number = _j + batchLen;
+              _lbl -= batchLen;
+              while (_j < batchEnd) {
+                const literalContext: number = LOOKUP[_clo1 + prevByte1] | LOOKUP[_clo2 + prevByte2];
+                prevByte2 = prevByte1;
+                if (_bo >= 16) {
+                  _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+                  _bo -= 16;
+                }
+                {
+                  let _rsOff: number = _ctb[literalContext];
+                  const _rsV: number = _ac >>> _bo;
+                  _rsOff += _rsV & 0xFF;
+                  const _rsE0: number = _ltg[_rsOff];
+                  const _rsBits: number = _rsE0 >> 16;
+                  if (_rsBits <= 8) {
+                    _bo += _rsBits;
+                    prevByte1 = _rsE0 & 0xFFFF;
+                  } else {
+                    _rsOff += _rsE0 & 0xFFFF;
+                    _rsOff += (_rsV & ((1 << _rsBits) - 1)) >>> 8;
+                    const _rsE1: number = _ltg[_rsOff];
+                    _bo += (_rsE1 >> 16) + 8;
+                    prevByte1 = _rsE1 & 0xFFFF;
+                  }
+                }
+                ringBuffer[_pos] = prevByte1;
+                _pos++;
+                _j++;
+              }
+              if (_pos >= fence) {
+                s.nextRunningState = 7;
+                s.runningState = 12;
+                break;
+              }
+            }
+            s.contextMapSlice = _cms;
+          }
+          s.literalBlockLength = _lbl;
+          if (s.runningState === 12) {
+            s.j = _j;
+            break commandLoop;
+          }
+          // === Distance decode ===
+          _mbl -= s.insertLength;
+          if (_mbl <= 0) {
+            s.runningState = 2;
+            break commandLoop;
+          }
+          let distanceCode: number = s.distanceCode;
+          if (distanceCode < 0) {
+            s.distance = s.rings[s.distRbIdx];
+          } else {
+            if (_ho > 2030) {
+              s.halfOffset = _ho;
+              result = readMoreInput(s);
+              if (result < 0) { s.bitOffset = _bo; s.accumulator32 = _ac; s.pos = _pos; s.metaBlockLength = _mbl; return result; }
+              _ho = s.halfOffset;
+            }
+            if (s.distanceBlockLength === 0) {
+              s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
+              decodeDistanceBlockSwitch(s);
+              _bo = s.bitOffset; _ac = s.accumulator32; _ho = s.halfOffset;
+              _dcms = s.distContextMapSlice;
+            }
+            s.distanceBlockLength--;
+            if (_bo >= 16) {
+              _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+              _bo -= 16;
+            }
+            const distTreeIdx: number = _dcm[_dcms + distanceCode] & 0xFF;
+            // Inline readSymbol for distance code
+            {
+              let _dOff: number = _dtg[distTreeIdx];
+              const _dV: number = _ac >>> _bo;
+              _dOff += _dV & 0xFF;
+              const _dE0: number = _dtg[_dOff];
+              const _dBits: number = _dE0 >> 16;
+              if (_dBits <= 8) {
+                _bo += _dBits;
+                distanceCode = _dE0 & 0xFFFF;
+              } else {
+                _dOff += _dE0 & 0xFFFF;
+                _dOff += (_dV & ((1 << _dBits) - 1)) >>> 8;
+                const _dE1: number = _dtg[_dOff];
+                _bo += (_dE1 >> 16) + 8;
+                distanceCode = _dE1 & 0xFFFF;
+              }
+            }
+            if (distanceCode < 16) {
+              const index: number = (s.distRbIdx + DISTANCE_SHORT_CODE_INDEX_OFFSET[distanceCode]) & 0x3;
+              s.distance = s.rings[index] + DISTANCE_SHORT_CODE_VALUE_OFFSET[distanceCode];
+              if (s.distance < 0) {
+                s.pos = _pos; s.metaBlockLength = _mbl;
+                s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
+                return makeError(s, -12);
+              }
+            } else {
+              const extraBits: number = _dExtra[distanceCode];
+              let bits: number;
+              if (_bo + extraBits <= 32) {
+                bits = (_ac >>> _bo) & ((1 << extraBits) - 1);
+                _bo += extraBits;
+              } else {
+                if (_bo >= 16) {
+                  _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+                  _bo -= 16;
+                }
+                if (extraBits <= 16) {
+                  bits = (_ac >>> _bo) & ((1 << extraBits) - 1);
+                  _bo += extraBits;
+                } else {
+                  const dLow: number = (_ac >>> _bo) & 0xFFFF;
+                  _bo += 16;
+                  _ac = (_sb[_ho++] << 16) | (_ac >>> 16);
+                  _bo -= 16;
+                  bits = dLow | (((_ac >>> _bo) & ((1 << (extraBits - 16)) - 1)) << 16);
+                  _bo += extraBits - 16;
                 }
               }
-              ringBuffer[_pos] = prevByte1;
-              _pos++;
-              _j++;
-            }
-            if (_pos >= fence) {
-              s.nextRunningState = 7;
-              s.runningState = 12;
-              break;
+              s.distance = _dOffset[distanceCode] + (bits << s.distancePostfixBits);
             }
           }
-          s.contextMapSlice = _cms;
-        }
-        // Write back all hoisted state
-        s.bitOffset = _bo;
-        s.accumulator32 = _ac;
-        s.halfOffset = _ho;
-        s.pos = _pos;
-        s.j = _j;
-        s.literalBlockLength = _lbl;
-        if (s.runningState !== 7) {
-          continue;
-        }
-      }
-        s.metaBlockLength -= s.insertLength;
-        if (s.metaBlockLength <= 0) {
-          s.runningState = 4;
-          continue;
-        }
-        let distanceCode: number = s.distanceCode;
-        if (distanceCode < 0) {
-          s.distance = s.rings[s.distRbIdx];
-        } else {
-          if (s.halfOffset > 2030) {
-            result = readMoreInput(s);
-            if (result < 0) {
-              return result;
-            }
-          }
-          if (s.distanceBlockLength === 0) {
-            decodeDistanceBlockSwitch(s);
-          }
-          s.distanceBlockLength--;
-          if (s.bitOffset >= 16) {
-            s.accumulator32 = (s.shortBuffer[s.halfOffset++] << 16) | (s.accumulator32 >>> 16);
-            s.bitOffset -= 16;
-          }
-          const distTreeIdx: number = s.distContextMap[s.distContextMapSlice + distanceCode] & 0xFF;
-          distanceCode = readSymbol(s.distanceTreeGroup, distTreeIdx, s);
-          if (distanceCode < 16) {
-            const index: number = (s.distRbIdx + DISTANCE_SHORT_CODE_INDEX_OFFSET[distanceCode]) & 0x3;
-            s.distance = s.rings[index] + DISTANCE_SHORT_CODE_VALUE_OFFSET[distanceCode];
-            if (s.distance < 0) {
-              return makeError(s, -12);
-            }
+          if (s.maxDistance !== s.maxBackwardDistance && _pos < s.maxBackwardDistance) {
+            s.maxDistance = _pos;
           } else {
-            const extraBits: number = s.distExtraBits[distanceCode];
-            let bits: number;
-            if (s.bitOffset + extraBits <= 32) {
-              bits = readFewBits(s, extraBits);
-            } else {
-              if (s.bitOffset >= 16) {
-                s.accumulator32 = (s.shortBuffer[s.halfOffset++] << 16) | (s.accumulator32 >>> 16);
-                s.bitOffset -= 16;
+            s.maxDistance = s.maxBackwardDistance;
+          }
+          if (s.distance > s.maxDistance) {
+            s.runningState = 9;
+            break commandLoop;
+          }
+          if (distanceCode > 0) {
+            s.distRbIdx = (s.distRbIdx + 1) & 0x3;
+            s.rings[s.distRbIdx] = s.distance;
+          }
+          if (s.copyLength > _mbl) {
+            s.pos = _pos; s.metaBlockLength = _mbl;
+            s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
+            return makeError(s, -9);
+          }
+          s.j = 0;
+          _phase = 8;
+        }
+        // === Phase 8: Copy loop ===
+        {
+          const _dist: number = s.distance;
+          let src: number = (_pos - _dist) & ringBufferMask;
+          let dst: number = _pos;
+          const _cl: number = s.copyLength - s.j;
+          const srcEnd: number = src + _cl;
+          const dstEnd: number = dst + _cl;
+          if ((srcEnd < ringBufferMask) && (dstEnd < ringBufferMask)) {
+            if (_dist === 1) {
+              ringBuffer.fill(ringBuffer[src], dst, dstEnd);
+            } else if (_dist <= 8 && _cl >= 2 * _dist) {
+              for (let k = 0; k < _dist; k++) ringBuffer[dst + k] = ringBuffer[src + k];
+              let written: number = _dist;
+              let chunk: number = written;
+              while (written + chunk <= _cl) {
+                ringBuffer.copyWithin(dst + written, dst, dst + chunk);
+                written += chunk;
+                chunk <<= 1;
               }
-              bits = (extraBits <= 16) ? readFewBits(s, extraBits) : readManyBits(s, extraBits);
+              if (written < _cl) {
+                ringBuffer.copyWithin(dst + written, dst, dst + (_cl - written));
+              }
+            } else if (_cl < 12 || (srcEnd > dst && dstEnd > src)) {
+              const numQuads: number = (_cl + 3) >> 2;
+              for (let k = 0; k < numQuads; ++k) {
+                ringBuffer[dst++] = ringBuffer[src++];
+                ringBuffer[dst++] = ringBuffer[src++];
+                ringBuffer[dst++] = ringBuffer[src++];
+                ringBuffer[dst++] = ringBuffer[src++];
+              }
+            } else {
+              ringBuffer.copyWithin(dst, src, srcEnd);
             }
-            s.distance = s.distOffset[distanceCode] + (bits << s.distancePostfixBits);
-          }
-        }
-        if (s.maxDistance !== s.maxBackwardDistance && s.pos < s.maxBackwardDistance) {
-          s.maxDistance = s.pos;
-        } else {
-          s.maxDistance = s.maxBackwardDistance;
-        }
-        if (s.distance > s.maxDistance) {
-          s.runningState = 9;
-          continue;
-        }
-        if (distanceCode > 0) {
-          s.distRbIdx = (s.distRbIdx + 1) & 0x3;
-          s.rings[s.distRbIdx] = s.distance;
-        }
-        if (s.copyLength > s.metaBlockLength) {
-          return makeError(s, -9);
-        }
-        s.j = 0;
-        s.runningState = 8;
-        continue;
-      case 8:
-        let src: number = (s.pos - s.distance) & ringBufferMask;
-        let dst: number = s.pos;
-        const copyLength: number = s.copyLength - s.j;
-        const srcEnd: number = src + copyLength;
-        const dstEnd: number = dst + copyLength;
-        if ((srcEnd < ringBufferMask) && (dstEnd < ringBufferMask)) {
-          if (s.distance === 1) {
-            // Single byte repeat — native memset
-            ringBuffer.fill(ringBuffer[src], dst, dstEnd);
-          } else if (s.distance === 4 && copyLength >= 8) {
-            // d=4 repeating pattern, common in font table structures
-            ringBuffer[dst] = ringBuffer[src];
-            ringBuffer[dst + 1] = ringBuffer[src + 1];
-            ringBuffer[dst + 2] = ringBuffer[src + 2];
-            ringBuffer[dst + 3] = ringBuffer[src + 3];
-            let written = 4;
-            while (written < copyLength) {
-              const chunk = Math.min(written, copyLength - written);
-              ringBuffer.copyWithin(dst + written, dst, dst + chunk);
-              written += chunk;
-            }
-          } else if (copyLength < 12 || (srcEnd > dst && dstEnd > src)) {
-            const numQuads: number = (copyLength + 3) >> 2;
-            for (let k = 0; k < numQuads; ++k) {
-              ringBuffer[dst++] = ringBuffer[src++];
-              ringBuffer[dst++] = ringBuffer[src++];
-              ringBuffer[dst++] = ringBuffer[src++];
-              ringBuffer[dst++] = ringBuffer[src++];
-            }
+            s.j = s.copyLength;
+            _mbl -= _cl;
+            _pos += _cl;
           } else {
-            ringBuffer.copyWithin(dst, src, srcEnd);
-          }
-          s.j += copyLength;
-          s.metaBlockLength -= copyLength;
-          s.pos += copyLength;
-        } else {
-          while (s.j < s.copyLength) {
-            ringBuffer[s.pos] = ringBuffer[(s.pos - s.distance) & ringBufferMask];
-            s.metaBlockLength--;
-            s.pos++;
-            s.j++;
-            if (s.pos >= fence) {
-              s.nextRunningState = 8;
-              s.runningState = 12;
-              break;
+            while (s.j < s.copyLength) {
+              ringBuffer[_pos] = ringBuffer[(_pos - _dist) & ringBufferMask];
+              _mbl--;
+              _pos++;
+              s.j++;
+              if (_pos >= fence) {
+                s.nextRunningState = 8;
+                s.runningState = 12;
+                break;
+              }
+            }
+            if (s.j < s.copyLength) {
+              break commandLoop;
             }
           }
+          _phase = 4;
+          continue commandLoop;
         }
-        if (s.runningState === 8) {
-          s.runningState = 4;
-        }
+        } // end commandLoop
+        s.bitOffset = _bo; s.accumulator32 = _ac; s.halfOffset = _ho;
+        s.pos = _pos; s.metaBlockLength = _mbl;
         continue;
+      }
       case 9:
         result = doUseDictionary(s, fence);
         if (result < 0) {
@@ -1888,6 +1985,7 @@ class State {
   commandTreeGroup = new Int32Array(0);
   distanceTreeGroup = new Int32Array(0);
   distOffset = new Int32Array(0);
+  contextTreeBase = new Int32Array(64);
   accumulator64 = 0;
   runningState = 0;
   nextRunningState = 0;
