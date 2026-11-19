@@ -4,6 +4,14 @@
 import { BitWriter } from './bit-writer'
 import { log2FloorNonZero } from './fast-log'
 import { BlockSplit, splitBlock, createBlockSplit } from './block-splitter'
+import { splitBlockGreedy } from './block-splitter-greedy'
+
+const HQ_BLOCK_SPLIT_QUALITY = 10
+// With this many block types the grouped histograms fit one clustering batch
+const MAX_TYPES_FOR_CHEAP_CONTEXT_MODELING = 8
+// The format's limit on trees per category
+const MAX_HISTOGRAMS_HQ = 256
+
 import {
   HistogramLiteral,
   HistogramCommand,
@@ -23,14 +31,26 @@ import {
   getInsertExtra,
   getCopyBase,
   getCopyExtra,
+  commandDistanceContext,
+  commandRestoreDistanceCode,
+  distancePrefixSymbol,
+  prefixEncodeCopyDistance,
 } from './command'
+import { populationCost } from './bit-cost'
 import {
   buildAndStoreHuffmanTree,
   storeVarLenUint8,
   encodeContextMap,
 } from './context-map'
-import { NUM_LITERAL_CODES, NUM_COMMAND_CODES } from './enc-constants'
-import { ContextType, getContextLut, getContext, chooseContextMode, NUM_LITERAL_CONTEXTS, NUM_DISTANCE_CONTEXTS } from './context'
+import {
+  NUM_LITERAL_CODES,
+  NUM_COMMAND_CODES,
+  MIN_QUALITY_FOR_BLOCK_SPLIT,
+  MIN_QUALITY_FOR_CONTEXT_MODELING,
+  MIN_QUALITY_FOR_HQ_CONTEXT_MODELING,
+} from './enc-constants'
+import { ContextType, getContextLut, getContext, NUM_LITERAL_CONTEXTS, NUM_DISTANCE_CONTEXTS } from './context'
+import { isMostlyUTF8 } from './literal-cost'
 import { clusterHistograms, createClusterHistogram, computeClusterBitCost } from './cluster'
 
 // Block length prefix code table - must match decoder exactly
@@ -279,11 +299,11 @@ export function storeCommandExtra(writer: BitWriter, cmd: Command): void {
   const insExtraVal = cmd.insertLen - getInsertBase(insCode)
   const copyExtraVal = copyLenCode - getCopyBase(copyCode)
   
-  // Pack both extra values together
-  const totalBits = insNumExtra + getCopyExtra(copyCode)
-  const combinedBits = (copyExtraVal << insNumExtra) | insExtraVal
-  
-  writer.writeBits(totalBits, combinedBits)
+  // Written as two fields rather than one packed value: the combination needs
+  // up to 34 bits, past what a 32-bit shift can hold. The stream is LSB-first,
+  // so back-to-back writes give the same encoding
+  writer.writeBits(insNumExtra, insExtraVal)
+  writer.writeBits(getCopyExtra(copyCode), copyExtraVal)
 }
 
 // Store a trivial (no block splitting) metablock
@@ -500,6 +520,90 @@ class BlockEncoder {
   }
 }
 
+const MAX_NPOSTFIX = 3
+// Distance alphabet size at the largest NPOSTFIX and NDIRECT, rounded up
+const MAX_DISTANCE_SYMBOLS = 544
+const distanceParamHistogram = new Uint32Array(MAX_DISTANCE_SYMBOLS)
+
+// Bits needed for every distance in `commands` if coded with the new parameters
+function distanceCost(
+  commands: Command[],
+  origNpostfix: number,
+  origNdirect: number,
+  npostfix: number,
+  ndirect: number
+): number {
+  const histogram = distanceParamHistogram
+  histogram.fill(0)
+  const same = npostfix === origNpostfix && ndirect === origNdirect
+  let total = 0
+  let extraBits = 0
+  for (let i = 0; i < commands.length; i++) {
+    const cmd = commands[i]
+    if (commandCopyLen(cmd) && cmd.cmdPrefix >= 128) {
+      const prefix = same
+        ? cmd.distPrefix
+        : distancePrefixSymbol(
+            commandRestoreDistanceCode(cmd, origNdirect, origNpostfix), ndirect, npostfix)
+      histogram[prefix & 0x3FF]++
+      extraBits += prefix >>> 10
+      total++
+    }
+  }
+  return populationCost(histogram, total) + extraBits
+}
+
+// Searches NPOSTFIX and NDIRECT for the cheapest distance coding and rewrites
+// the commands to use it. Structured data such as fonts favours nonzero values
+// because its distances share low bits
+function optimizeDistanceParams(
+  commands: Command[],
+  origNpostfix: number,
+  origNdirect: number
+): [number, number] {
+  let bestCost = Infinity
+  let bestNpostfix = origNpostfix
+  let bestNdirect = origNdirect
+  let checkOrig = true
+  let ndirectMsb = 0
+
+  // Hill climb: NDIRECT grows until the cost rises, then the next NPOSTFIX
+  // starts from half of where the last one stopped
+  for (let npostfix = 0; npostfix <= MAX_NPOSTFIX; npostfix++) {
+    for (; ndirectMsb < 16; ndirectMsb++) {
+      const ndirect = ndirectMsb << npostfix
+      if (npostfix === origNpostfix && ndirect === origNdirect) checkOrig = false
+      const cost = distanceCost(commands, origNpostfix, origNdirect, npostfix, ndirect)
+      if (cost > bestCost) break
+      bestCost = cost
+      bestNpostfix = npostfix
+      bestNdirect = ndirect
+    }
+    if (ndirectMsb > 0) ndirectMsb--
+    ndirectMsb >>>= 1
+  }
+  if (checkOrig) {
+    const cost = distanceCost(commands, origNpostfix, origNdirect, origNpostfix, origNdirect)
+    if (cost < bestCost) {
+      bestNpostfix = origNpostfix
+      bestNdirect = origNdirect
+    }
+  }
+
+  if (bestNpostfix !== origNpostfix || bestNdirect !== origNdirect) {
+    for (let i = 0; i < commands.length; i++) {
+      const cmd = commands[i]
+      if (commandCopyLen(cmd) && cmd.cmdPrefix >= 128) {
+        const [prefix, extra] = prefixEncodeCopyDistance(
+          commandRestoreDistanceCode(cmd, origNdirect, origNpostfix), bestNdirect, bestNpostfix)
+        cmd.distPrefix = prefix
+        cmd.distExtra = extra
+      }
+    }
+  }
+  return [bestNpostfix, bestNdirect]
+}
+
 // Full metablock encoding with block splitting and context modeling
 export function storeMetaBlock(
   writer: BitWriter,
@@ -515,9 +619,15 @@ export function storeMetaBlock(
   ndirect: number = 0
 ): void {
   // For short inputs or low quality, use trivial encoding
-  if (length < 128 || quality < 5 || commands.length < 6) {
+  if (length < 128 || quality < MIN_QUALITY_FOR_BLOCK_SPLIT || commands.length < 6) {
     storeMetaBlockTrivial(writer, input, startPos, length, mask, isLast, commands, distanceAlphabetSize, npostfix, ndirect)
     return
+  }
+
+  // Runs before splitting so the distance split sees the final symbols
+  if (quality >= HQ_BLOCK_SPLIT_QUALITY) {
+    [npostfix, ndirect] = optimizeDistanceParams(commands, npostfix, ndirect)
+    distanceAlphabetSize = 16 + ndirect + (48 << npostfix)
   }
 
   // Split blocks
@@ -525,7 +635,12 @@ export function storeMetaBlock(
   const commandSplit = createBlockSplit(1024)
   const distanceSplit = createBlockSplit(1024)
 
-  splitBlock(commands, input, startPos, mask, quality, literalSplit, commandSplit, distanceSplit)
+  // The iterative splitter is only worth its cost at the Zopfli qualities
+  if (quality < HQ_BLOCK_SPLIT_QUALITY) {
+    splitBlockGreedy(commands, input, startPos, mask, literalSplit, commandSplit, distanceSplit)
+  } else {
+    splitBlock(commands, input, startPos, mask, quality, literalSplit, commandSplit, distanceSplit)
+  }
 
   // If splitting didn't produce multiple block types, use trivial encoding
   if (literalSplit.numTypes <= 1 && commandSplit.numTypes <= 1 && distanceSplit.numTypes <= 1) {
@@ -534,13 +649,27 @@ export function storeMetaBlock(
   }
 
   // Choose context mode for literals
-  const contextMode = chooseContextMode(input, startPos, Math.min(length, 4096))
+  // Clustering literal contexts costs little when there are few block types,
+  // as with text. Binary data has dozens, each with a dense histogram, and
+  // there it is the single largest cost, so only the slower qualities pay it
+  const modelContexts =
+    quality >= MIN_QUALITY_FOR_HQ_CONTEXT_MODELING ||
+    (quality >= MIN_QUALITY_FOR_CONTEXT_MODELING &&
+     literalSplit.numTypes <= MAX_TYPES_FOR_CHEAP_CONTEXT_MODELING)
+
+  // Signed contexts model binary data better than the UTF-8 ones
+  const contextMode =
+    modelContexts && !isMostlyUTF8(input, startPos, mask, length)
+      ? ContextType.SIGNED
+      : ContextType.UTF8
   const contextLut = getContextLut(contextMode)
 
-  // Build histograms per context
+  // One histogram per (block type, context), or per block type alone when
+  // contexts are not modelled
   const numLiteralContexts = literalSplit.numTypes * NUM_LITERAL_CONTEXTS
+  const numLiteralHistograms = modelContexts ? numLiteralContexts : literalSplit.numTypes
   const literalHistograms: Uint32Array[] = []
-  for (let i = 0; i < numLiteralContexts; i++) {
+  for (let i = 0; i < numLiteralHistograms; i++) {
     literalHistograms.push(new Uint32Array(NUM_LITERAL_CODES))
   }
 
@@ -572,8 +701,12 @@ export function storeMetaBlock(
   let distBlockType = distanceSplit.numBlocks > 0 ? distanceSplit.types[0] : 0
   let distCount = 0
 
-  let prevByte1 = 0
-  let prevByte2 = 0
+  // Literal context runs on across metablocks, so it starts from the bytes
+  // just before this one; the decoder does the same
+  const initialPrevByte1 = startPos > 0 ? input[(startPos - 1) & mask] : 0
+  const initialPrevByte2 = startPos > 1 ? input[(startPos - 2) & mask] : 0
+  let prevByte1 = initialPrevByte1
+  let prevByte2 = initialPrevByte2
 
   for (const cmd of commands) {
     // Update command block
@@ -597,8 +730,9 @@ export function storeMetaBlock(
       }
 
       const literal = input[(pos + j) & mask]
-      const context = getContext(prevByte1, prevByte2, contextLut)
-      const histoIdx = litBlockType * NUM_LITERAL_CONTEXTS + context
+      const histoIdx = modelContexts
+        ? litBlockType * NUM_LITERAL_CONTEXTS + getContext(prevByte1, prevByte2, contextLut)
+        : litBlockType
       literalHistograms[histoIdx][literal]++
       litCount++
 
@@ -619,7 +753,9 @@ export function storeMetaBlock(
       }
 
       const distCode = cmd.distPrefix & 0x3FF
-      const distContext = copyLen > 4 ? 3 : copyLen - 2
+      // Derived from the command prefix, which carries the length *code*; that
+      // differs from the actual copy length for dictionary matches
+      const distContext = commandDistanceContext(cmd)
       const histoIdx = distBlockType * NUM_DISTANCE_CONTEXTS + distContext
       distanceHistograms[histoIdx][distCode]++
       distCount++
@@ -636,20 +772,35 @@ export function storeMetaBlock(
     pos += copyLen
   }
 
-  // Cluster literal histograms
+  // Cluster literal histograms. Below the Zopfli qualities the contexts are
+  // grouped coarsely first, which keeps the clustering input small
   const literalContextMap = new Uint32Array(numLiteralContexts)
-  const numLiteralClusters = clusterAndBuildContextMap(
-    literalHistograms, numLiteralContexts, NUM_LITERAL_CODES, literalContextMap
-  )
+  let numLiteralClusters: number
+  if (quality >= HQ_BLOCK_SPLIT_QUALITY) {
+    numLiteralClusters = clusterAndBuildContextMap(
+      literalHistograms, numLiteralContexts, NUM_LITERAL_CODES, literalContextMap,
+      MAX_HISTOGRAMS_HQ)
+  } else if (modelContexts) {
+    numLiteralClusters = clusterLiteralContextsCoarse(
+      literalHistograms, literalSplit.numTypes, literalContextMap)
+  } else {
+    // One tree per block type
+    for (let i = 0; i < numLiteralContexts; i++) {
+      literalContextMap[i] = i >>> LITERAL_CONTEXT_BITS
+    }
+    numLiteralClusters = literalSplit.numTypes
+  }
 
   // Cluster distance histograms
   const distanceContextMap = new Uint32Array(numDistanceContexts)
   const numDistanceClusters = clusterAndBuildContextMap(
-    distanceHistograms, numDistanceContexts, distanceAlphabetSize, distanceContextMap
-  )
+    distanceHistograms, numDistanceContexts, distanceAlphabetSize, distanceContextMap,
+    quality >= HQ_BLOCK_SPLIT_QUALITY ? MAX_HISTOGRAMS_HQ : 64)
 
   // Build clustered histograms
-  const clusteredLitHistos = buildClusteredHistograms(literalHistograms, literalContextMap, numLiteralClusters, NUM_LITERAL_CODES)
+  const clusteredLitHistos = modelContexts
+    ? buildClusteredHistograms(literalHistograms, literalContextMap, numLiteralClusters, NUM_LITERAL_CODES)
+    : literalHistograms
   const clusteredDistHistos = buildClusteredHistograms(distanceHistograms, distanceContextMap, numDistanceClusters, distanceAlphabetSize)
 
   // Command histograms don't use context - one per block type
@@ -713,8 +864,8 @@ export function storeMetaBlock(
 
   // Store commands and data
   pos = startPos
-  prevByte1 = 0
-  prevByte2 = 0
+  prevByte1 = initialPrevByte1
+  prevByte2 = initialPrevByte2
 
   for (const cmd of commands) {
     // Store command
@@ -738,7 +889,9 @@ export function storeMetaBlock(
       const distCode = cmd.distPrefix & 0x3FF
       const distNumExtra = cmd.distPrefix >>> 10
       const distExtra = cmd.distExtra
-      const distContext = copyLen > 4 ? 3 : copyLen - 2
+      // Derived from the command prefix, which carries the length *code*; that
+      // differs from the actual copy length for dictionary matches
+      const distContext = commandDistanceContext(cmd)
       
       distanceEnc.storeSymbolWithContext(writer, distCode, distContext, distanceContextMap, DISTANCE_CONTEXT_BITS)
       writer.writeBits(distNumExtra, distExtra)
@@ -760,11 +913,58 @@ export function storeMetaBlock(
   }
 }
 
+const COARSE_CONTEXT_GROUPS = 8
+
+// Full clustering takes every (block type, context) histogram as input, which
+// is 64 per block type. Here the 64 contexts are first merged into a few
+// groups using whole-metablock statistics, and block types are then clustered
+// per group
+function clusterLiteralContextsCoarse(
+  histograms: Uint32Array[],
+  numTypes: number,
+  contextMap: Uint32Array
+): number {
+  const perContext: Uint32Array[] = []
+  for (let c = 0; c < NUM_LITERAL_CONTEXTS; c++) {
+    const sum = new Uint32Array(NUM_LITERAL_CODES)
+    for (let t = 0; t < numTypes; t++) {
+      const h = histograms[t * NUM_LITERAL_CONTEXTS + c]
+      for (let i = 0; i < NUM_LITERAL_CODES; i++) sum[i] += h[i]
+    }
+    perContext.push(sum)
+  }
+  const group = new Uint32Array(NUM_LITERAL_CONTEXTS)
+  const numGroups = clusterAndBuildContextMap(
+    perContext, NUM_LITERAL_CONTEXTS, NUM_LITERAL_CODES, group, COARSE_CONTEXT_GROUPS)
+
+  const reduced: Uint32Array[] = []
+  for (let i = 0; i < numTypes * numGroups; i++) {
+    reduced.push(new Uint32Array(NUM_LITERAL_CODES))
+  }
+  for (let t = 0; t < numTypes; t++) {
+    for (let c = 0; c < NUM_LITERAL_CONTEXTS; c++) {
+      const h = histograms[t * NUM_LITERAL_CONTEXTS + c]
+      const r = reduced[t * numGroups + group[c]]
+      for (let i = 0; i < NUM_LITERAL_CODES; i++) r[i] += h[i]
+    }
+  }
+  const reducedMap = new Uint32Array(reduced.length)
+  const numClusters = clusterAndBuildContextMap(
+    reduced, reduced.length, NUM_LITERAL_CODES, reducedMap)
+
+  for (let i = 0; i < contextMap.length; i++) {
+    const t = (i / NUM_LITERAL_CONTEXTS) | 0
+    contextMap[i] = reducedMap[t * numGroups + group[i % NUM_LITERAL_CONTEXTS]]
+  }
+  return numClusters
+}
+
 function clusterAndBuildContextMap(
   histograms: Uint32Array[],
   numHistograms: number,
   alphabetSize: number,
-  contextMap: Uint32Array
+  contextMap: Uint32Array,
+  maxClusters: number = 64
 ): number {
   if (numHistograms <= 1) {
     contextMap[0] = 0
@@ -786,7 +986,7 @@ function clusterAndBuildContextMap(
   const out = histograms.map(() => createClusterHistogram(alphabetSize))
 
   // Cluster
-  clusterHistograms(clusterHistos, numHistograms, 64, out, contextMap)
+  clusterHistograms(clusterHistos, numHistograms, maxClusters, out, contextMap)
 
   // Count clusters
   let maxCluster = 0

@@ -15,6 +15,9 @@ export interface HasherSearchResult {
   distance: number
   score: number
   lenCodeDelta: number
+  // The distance alone cannot identify a dictionary match: a bogus
+  // out-of-range backward reference looks the same
+  fromDictionary: boolean
 }
 
 export const LITERAL_BYTE_SCORE = 135
@@ -76,6 +79,30 @@ export function findMatchLength(
   return matched
 }
 
+// Same result as findMatchLength, four bytes per step. The caller guarantees
+// both ranges are in bounds, since a word read past the end throws
+export function findMatchLengthWide(
+  view: DataView,
+  data: Uint8Array,
+  s1: number,
+  s2: number,
+  limit: number
+): number {
+  let matched = 0
+  while (matched + 4 <= limit) {
+    const diff = view.getUint32(s1 + matched, true) ^ view.getUint32(s2 + matched, true)
+    if (diff !== 0) {
+      // Little-endian, so the lowest set bit is in the first differing byte
+      return matched + ((31 - Math.clz32(diff & -diff)) >>> 3)
+    }
+    matched += 4
+  }
+  while (matched < limit && data[s1 + matched] === data[s2 + matched]) {
+    matched++
+  }
+  return matched
+}
+
 export function findMatchLengthWithLimit(
   s1: Uint8Array,
   s1Offset: number,
@@ -116,6 +143,7 @@ export function createDictionaryBackwardMatch(
 
 export function createSearchResult(): HasherSearchResult {
   return {
+    fromDictionary: false,
     len: 0,
     distance: 0,
     score: 0,
@@ -158,6 +186,11 @@ export function createDistanceCache(): Int32Array {
 }
 
 export const HASH_MUL_32 = 0x1E35A7BD
+
+// hashBytes4 for a word already read little-endian
+export function hashWord(word: number, bucketBits: number): number {
+  return (Math.imul(word, HASH_MUL_32) >>> 0) >>> (32 - bucketBits)
+}
 
 export function hashBytes4(data: Uint8Array, pos: number, bucketBits: number): number {
   // Read 4 bytes little-endian

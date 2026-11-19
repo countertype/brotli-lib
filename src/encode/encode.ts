@@ -10,38 +10,24 @@ import {
   computeLgBlock,
   ZOPFLIFICATION_QUALITY,
   HQ_ZOPFLIFICATION_QUALITY,
+  MIN_QUALITY_FOR_BLOCK_SPLIT,
+  MAX_NUM_DELAYED_SYMBOLS,
 } from './enc-constants'
 import { SimpleHasher, createSimpleHasher } from './hash-simple'
 import { HashChainHasher, createHashChainHasher } from './hash-chains'
 import { BinaryTreeHasher, createBinaryTreeHasher } from './hash-binary-tree'
-import { createBackwardReferences } from './backward-references'
+import { createBackwardReferences, createBackwardReferencesQuick } from './backward-references'
 import { createZopfliBackwardReferences, createHqZopfliBackwardReferences } from './backward-references-hq'
 import { Command, createInsertCommand, commandCopyLen } from './command'
 import { storeMetaBlockTrivial, storeMetaBlock, storeUncompressedMetaBlock } from './metablock'
+import { FLAT_INPUT_MASK } from './enc-constants'
+import { createDistanceCache } from './match'
 
 export interface BrotliEncodeOptions {
   quality?: number    // 0-11, default 11
   lgwin?: number      // 10-24, default 22
   mode?: EncoderMode  // default GENERIC
   sizeHint?: number   // default 0 (unknown)
-}
-
-export interface BrotliEncoderState {
-  params: EncoderParams
-  hasher: SimpleHasher | HashChainHasher | BinaryTreeHasher | null
-  distCache: Int32Array
-  lastInsertLen: number
-  commands: Command[]
-  numLiterals: number
-  inputPos: number
-  lastProcessedPos: number
-  ringBuffer: Uint8Array
-  ringBufferMask: number
-  prevByte: number
-  prevByte2: number
-  isInitialized: boolean
-  isLastBlockEmitted: boolean
-  writer: BitWriter
 }
 
 // One-Shot Encoding
@@ -146,8 +132,11 @@ function encodeFast(input: Uint8Array, params: EncoderParams): Uint8Array {
   
   // Create hasher
   const hasher = createSimpleHasher(params.quality, params.lgwin)
-  const distCache = new Int32Array([4, 11, 15, 16])
-  const ringBufferMask = (1 << params.lgwin) - 1
+  const distCache = createDistanceCache()
+  // Positions are absolute: the whole input is passed through rather than a
+  // circular buffer. maxBackwardLimit is what enforces the window
+  const ringBufferMask = FLAT_INPUT_MASK
+  const maxBackwardLimit = (1 << params.lgwin) - 16
   
   // Process in blocks
   const blockSize = 1 << params.lgblock
@@ -158,10 +147,11 @@ function encodeFast(input: Uint8Array, params: EncoderParams): Uint8Array {
     const isLast = pos + blockLen >= input.length
     
     // Find backward references
-    const [commands] = createBackwardReferences(
+    const [commands] = createBackwardReferencesQuick(
       blockLen, pos, input, ringBufferMask,
-      hasher, distCache, 0, params.quality,
-      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
+      hasher, distCache, 0,
+      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes,
+      maxBackwardLimit
     )
     
     // Store metablock
@@ -174,7 +164,8 @@ function encodeFast(input: Uint8Array, params: EncoderParams): Uint8Array {
     
     pos += blockLen
   }
-  
+
+  hasher.release()
   return writer.finish()
 }
 
@@ -195,21 +186,33 @@ function encodeStandard(input: Uint8Array, params: EncoderParams): Uint8Array {
   } else if (params.quality <= 9) {
     hasher = createHashChainHasher(params.quality, params.lgwin)
   } else {
-    hasher = createBinaryTreeHasher(params.lgwin, input.length)
+    hasher = createBinaryTreeHasher(params.lgwin, input.length, params.quality)
   }
   
   // Initialize state
-  const distCache = new Int32Array([4, 11, 15, 16])
-  const ringBufferMask = (1 << params.lgwin) - 1
+  const distCache = createDistanceCache()
+  // Positions are absolute: the whole input is passed through rather than a
+  // circular buffer. maxBackwardLimit is what enforces the window
+  const ringBufferMask = FLAT_INPUT_MASK
+  const maxBackwardLimit = (1 << params.lgwin) - 16
   
   // Process in metablocks
-  const maxMetablockSize = 1 << 24
+  // Bounded by the window: a metablock larger than the decoder's ring buffer
+  // cannot be followed
+  const maxMetablockSize =
+    1 << Math.min(1 + Math.max(params.lgwin, params.lgblock), 24)
   let pos = 0
-  
+
+  if (params.quality < MIN_QUALITY_FOR_BLOCK_SPLIT && hasher instanceof SimpleHasher) {
+    encodeUnsplit(writer, input, params, hasher, distCache, maxBackwardLimit, maxMetablockSize)
+    hasher.release()
+    return writer.finish()
+  }
+
   while (pos < input.length) {
     const metablockLen = Math.min(input.length - pos, maxMetablockSize)
     const isLast = pos + metablockLen >= input.length
-    
+
     // Find backward references
     let commands: Command[]
     let lastInsertLen = 0
@@ -219,28 +222,32 @@ function encodeStandard(input: Uint8Array, params: EncoderParams): Uint8Array {
       [commands, , lastInsertLen] = createHqZopfliBackwardReferences(
         metablockLen, pos, input, ringBufferMask,
         hasher, distCache, 0,
-        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes,
+        maxBackwardLimit
       )
     } else if (params.quality >= ZOPFLIFICATION_QUALITY && hasher instanceof BinaryTreeHasher) {
       // Quality 10: use Zopfli
       [commands, , lastInsertLen] = createZopfliBackwardReferences(
         metablockLen, pos, input, ringBufferMask,
         params.quality, hasher, distCache, 0,
-        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes,
+        maxBackwardLimit
       )
     } else if (hasher instanceof HashChainHasher) {
       // Quality 5-9: use hash chains
       [commands, , lastInsertLen] = createBackwardReferences(
         metablockLen, pos, input, ringBufferMask,
         hasher, distCache, 0, params.quality,
-        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes,
+        maxBackwardLimit
       )
     } else if (hasher instanceof SimpleHasher) {
       // Quality 2-4: use simple hasher
-      [commands, , lastInsertLen] = createBackwardReferences(
+      [commands, , lastInsertLen] = createBackwardReferencesQuick(
         metablockLen, pos, input, ringBufferMask,
-        hasher, distCache, 0, params.quality,
-        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
+        hasher, distCache, 0,
+        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes,
+        maxBackwardLimit
       )
     } else {
       // Fallback
@@ -276,8 +283,64 @@ function encodeStandard(input: Uint8Array, params: EncoderParams): Uint8Array {
     
     pos += metablockLen
   }
-  
+
+  // The quick and chain hashers are pooled and hold a view of the input
+  if (!(hasher instanceof BinaryTreeHasher)) hasher.release()
   return writer.finish()
+}
+
+// Qualities without block splitting get their adaptivity from short
+// metablocks instead: each carries its own prefix codes, so one is closed as
+// soon as it holds enough symbols to pay for them
+function encodeUnsplit(
+  writer: BitWriter,
+  input: Uint8Array,
+  params: EncoderParams,
+  hasher: SimpleHasher,
+  distCache: Int32Array,
+  maxBackwardLimit: number,
+  maxMetablockSize: number
+): void {
+  const blockSize = 1 << params.lgblock
+  const distAlphabetSize = calculateDistanceAlphabetSize(params)
+  let commands: Command[] = []
+  let numLiterals = 0
+  let lastInsertLen = 0
+  let metablockStart = 0
+  let pos = 0
+
+  while (pos < input.length) {
+    const blockLen = Math.min(input.length - pos, blockSize)
+    const [blockCommands, blockLiterals, trailing] = createBackwardReferencesQuick(
+      blockLen, pos, input, FLAT_INPUT_MASK,
+      hasher, distCache, lastInsertLen,
+      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes,
+      maxBackwardLimit, true
+    )
+    for (let i = 0; i < blockCommands.length; i++) commands.push(blockCommands[i])
+    numLiterals += blockLiterals
+    lastInsertLen = trailing
+    pos += blockLen
+
+    const isLast = pos >= input.length
+    const nextFits = pos - metablockStart + blockSize <= maxMetablockSize
+    if (!isLast && nextFits && numLiterals + commands.length < MAX_NUM_DELAYED_SYMBOLS) {
+      continue
+    }
+
+    if (lastInsertLen > 0) {
+      commands.push(createInsertCommand(lastInsertLen))
+      lastInsertLen = 0
+    }
+    storeMetaBlock(
+      writer, input, metablockStart, pos - metablockStart, FLAT_INPUT_MASK,
+      isLast, commands, distAlphabetSize, params.quality,
+      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
+    )
+    commands = []
+    numLiterals = 0
+    metablockStart = pos
+  }
 }
 
 function calculateDistanceAlphabetSize(params: EncoderParams): number {
@@ -287,12 +350,33 @@ function calculateDistanceAlphabetSize(params: EncoderParams): number {
 }
 
 // Streaming encoder for processing data in chunks
+//
+// Input is searched one block at a time as it arrives, and blocks accumulate
+// into a metablock until it is full, which is when output appears. Everything
+// after the search is shared with the one-shot path, so both compress alike
 export class BrotliEncoder {
-  private state: BrotliEncoderState
-  
+  private params: EncoderParams
+  private writer = new BitWriter()
+  private hasher: SimpleHasher | HashChainHasher | BinaryTreeHasher | null = null
+  private distCache = createDistanceCache()
+  // Twice the larger of window and block: while a block is being written, the
+  // window before it and the whole pending metablock are still intact
+  private ring: Uint8Array
+  private mask: number
+  private blockSize: number
+  private maxMetablockSize: number
+  private maxBackwardLimit: number
+  private inputPos = 0
+  private searchedPos = 0
+  private metablockStart = 0
+  private commands: Command[] = []
+  private numLiterals = 0
+  private lastInsertLen = 0
+  private finished = false
+
   constructor(options: BrotliEncodeOptions = {}) {
     const params = createDefaultParams()
-    
+
     if (options.quality !== undefined) {
       params.quality = Math.max(0, Math.min(11, options.quality))
     }
@@ -305,187 +389,125 @@ export class BrotliEncoder {
     if (options.sizeHint !== undefined) {
       params.sizeHint = options.sizeHint
     }
-    
+
     sanitizeParams(params)
     params.lgblock = computeLgBlock(params)
-    
-    const ringBufferSize = 1 << params.lgwin
-    
-    this.state = {
-      params,
-      hasher: null,
-      distCache: new Int32Array([4, 11, 15, 16]),
-      lastInsertLen: 0,
-      commands: [],
-      numLiterals: 0,
-      inputPos: 0,
-      lastProcessedPos: 0,
-      ringBuffer: new Uint8Array(ringBufferSize),
-      ringBufferMask: ringBufferSize - 1,
-      prevByte: 0,
-      prevByte2: 0,
-      isInitialized: false,
-      isLastBlockEmitted: false,
-      writer: new BitWriter(),
-    }
+    this.params = params
+
+    const ringBits = 1 + Math.max(params.lgwin, params.lgblock)
+    this.ring = new Uint8Array(1 << ringBits)
+    this.mask = (1 << ringBits) - 1
+    this.blockSize = 1 << params.lgblock
+    this.maxMetablockSize = 1 << Math.min(ringBits - 1, 24)
+    this.maxBackwardLimit = (1 << params.lgwin) - 16
   }
-  
-  private initialize(): void {
-    if (this.state.isInitialized) return
-    
-    const { params, writer } = this.state
-    
-    // Write window bits
+
+  update(input: Uint8Array): Uint8Array {
+    if (this.finished) {
+      throw new Error('BrotliEncoder: update() after finish()')
+    }
+    let offset = 0
+    while (offset < input.length) {
+      const pending = this.inputPos - this.searchedPos
+      const n = Math.min(this.blockSize - pending, input.length - offset)
+      // Blocks start on multiples of the block size, which divides the ring
+      // size, so a block never wraps
+      this.ring.set(input.subarray(offset, offset + n), this.inputPos & this.mask)
+      this.inputPos += n
+      offset += n
+      if (pending + n === this.blockSize) {
+        this.processBlock(false)
+      }
+    }
+    return this.writer.takeBytes()
+  }
+
+  finish(): Uint8Array {
+    if (!this.finished) {
+      this.finished = true
+      this.processBlock(true)
+    }
+    return this.writer.takeBytes()
+  }
+
+  private start(): void {
+    const { params, writer } = this
     const windowBits = encodeWindowBits(params.lgwin, params.largeWindow)
     writer.writeBits(windowBits.bits, windowBits.value)
-    
-    // Create hasher
+
     if (params.quality <= 4) {
-      this.state.hasher = createSimpleHasher(params.quality, params.lgwin)
+      // Not the shared instance: a stream outlives the call that created it
+      this.hasher = createSimpleHasher(params.quality, params.lgwin, false)
     } else if (params.quality <= 9) {
-      this.state.hasher = createHashChainHasher(params.quality, params.lgwin)
+      this.hasher = createHashChainHasher(params.quality, params.lgwin, false)
     } else {
-      this.state.hasher = createBinaryTreeHasher(params.lgwin)
+      this.hasher = createBinaryTreeHasher(params.lgwin, undefined, params.quality)
     }
-    
-    this.state.isInitialized = true
   }
-  
-  update(input: Uint8Array): Uint8Array {
-    this.initialize()
-    
-    const { ringBuffer, ringBufferMask } = this.state
-    
-    // Copy input to ring buffer
-    for (let i = 0; i < input.length; i++) {
-      ringBuffer[(this.state.inputPos + i) & ringBufferMask] = input[i]
-    }
-    this.state.inputPos += input.length
-    
-    // Process complete blocks
-    const blockSize = 1 << this.state.params.lgblock
-    const output: Uint8Array[] = []
-    
-    while (this.state.inputPos - this.state.lastProcessedPos >= blockSize) {
-      const chunk = this.processBlock(blockSize, false)
-      if (chunk.length > 0) {
-        output.push(chunk)
+
+  private processBlock(isLast: boolean): void {
+    if (this.hasher === null) this.start()
+    const { params, ring, mask, distCache, writer } = this
+    const hasher = this.hasher!
+    const npostfix = params.dist.distancePostfixBits
+    const ndirect = params.dist.numDirectDistanceCodes
+
+    const pos = this.searchedPos
+    const blockLen = this.inputPos - pos
+    if (blockLen > 0) {
+      let found: [Command[], number, number]
+      if (hasher instanceof BinaryTreeHasher) {
+        found = params.quality >= HQ_ZOPFLIFICATION_QUALITY
+          ? createHqZopfliBackwardReferences(
+              blockLen, pos, ring, mask, hasher, distCache, this.lastInsertLen,
+              npostfix, ndirect, this.maxBackwardLimit)
+          : createZopfliBackwardReferences(
+              blockLen, pos, ring, mask, params.quality, hasher, distCache,
+              this.lastInsertLen, npostfix, ndirect, this.maxBackwardLimit)
+      } else if (hasher instanceof SimpleHasher) {
+        found = createBackwardReferencesQuick(
+          blockLen, pos, ring, mask, hasher, distCache, this.lastInsertLen,
+          npostfix, ndirect, this.maxBackwardLimit, true)
+      } else {
+        found = createBackwardReferences(
+          blockLen, pos, ring, mask, hasher, distCache, this.lastInsertLen,
+          params.quality, npostfix, ndirect, this.maxBackwardLimit, true)
       }
+      const blockCommands = found[0]
+      for (let i = 0; i < blockCommands.length; i++) this.commands.push(blockCommands[i])
+      this.numLiterals += found[1]
+      this.lastInsertLen = found[2]
+      this.searchedPos = this.inputPos
     }
-    
-    // Concatenate output
-    if (output.length === 0) return new Uint8Array(0)
-    if (output.length === 1) return output[0]
-    
-    const totalLen = output.reduce((sum, arr) => sum + arr.length, 0)
-    const result = new Uint8Array(totalLen)
-    let offset = 0
-    for (const chunk of output) {
-      result.set(chunk, offset)
-      offset += chunk.length
+
+    const metablockLen = this.searchedPos - this.metablockStart
+    if (!isLast) {
+      const nextFits = metablockLen + this.blockSize <= this.maxMetablockSize
+      // Without block splitting, short metablocks are what adapts the codes
+      const enoughSymbols = params.quality < MIN_QUALITY_FOR_BLOCK_SPLIT &&
+        this.numLiterals + this.commands.length >= MAX_NUM_DELAYED_SYMBOLS
+      if (nextFits && !enoughSymbols) return
     }
-    return result
-  }
-  
-  finish(): Uint8Array {
-    this.initialize()
-    
-    // Process any remaining data
-    const remaining = this.state.inputPos - this.state.lastProcessedPos
-    if (remaining > 0) {
-      return this.processBlock(remaining, true)
-    }
-    
-    // Emit empty final block if needed
-    if (!this.state.isLastBlockEmitted) {
-      const { writer } = this.state
-      writer.writeBits(1, 1) // ISLAST
-      writer.writeBits(1, 1) // ISEMPTY
+
+    if (metablockLen === 0) {
+      // Only reachable at the end: an empty last metablock closes the stream
+      writer.writeBits(1, 1)
+      writer.writeBits(1, 1)
       writer.alignToByte()
-      this.state.isLastBlockEmitted = true
+      return
     }
-    
-    return this.state.writer.takeBytes()
-  }
-  
-  private processBlock(blockLen: number, isLast: boolean): Uint8Array {
-    const { params, ringBuffer, ringBufferMask, distCache, hasher, writer } = this.state
-    const pos = this.state.lastProcessedPos
-    
-    if (!hasher) {
-      throw new Error('Encoder not initialized')
+
+    if (this.lastInsertLen > 0) {
+      this.commands.push(createInsertCommand(this.lastInsertLen))
+      this.lastInsertLen = 0
     }
-    
-    // Find backward references
-    let commands: Command[]
-    let numLiterals: number
-    let lastInsertLen: number
-    
-    if (hasher instanceof SimpleHasher || hasher instanceof HashChainHasher) {
-      [commands, numLiterals, lastInsertLen] = createBackwardReferences(
-        blockLen, pos, ringBuffer, ringBufferMask,
-        hasher, distCache, this.state.lastInsertLen, params.quality,
-        params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
-      )
-    } else if (hasher instanceof BinaryTreeHasher) {
-      if (params.quality >= HQ_ZOPFLIFICATION_QUALITY) {
-        [commands, numLiterals, lastInsertLen] = createHqZopfliBackwardReferences(
-          blockLen, pos, ringBuffer, ringBufferMask,
-          hasher, distCache, this.state.lastInsertLen,
-          params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
-        )
-      } else {
-        [commands, numLiterals, lastInsertLen] = createZopfliBackwardReferences(
-          blockLen, pos, ringBuffer, ringBufferMask,
-          params.quality, hasher, distCache, this.state.lastInsertLen,
-          params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
-        )
-      }
-    } else {
-      commands = [createInsertCommand(blockLen)]
-      numLiterals = blockLen
-      lastInsertLen = 0
-    }
-    
-    // Handle trailing literals (Zopfli returns these separately).
-    // Insert length is *before* the copy; we may only merge with an insert-only
-    // command (copyLen == 0).
-    if (lastInsertLen > 0) {
-      if (commands.length === 0) {
-        commands = [createInsertCommand(blockLen)]
-      } else {
-        const lastCmd = commands[commands.length - 1]
-        if (commandCopyLen(lastCmd) === 0) {
-          lastCmd.insertLen += lastInsertLen
-        } else {
-          commands.push(createInsertCommand(lastInsertLen))
-        }
-      }
-    } else if (commands.length === 0) {
-      // All literals, no matches
-      commands = [createInsertCommand(blockLen)]
-    }
-    
-    // Store metablock
-    const distAlphabetSize = calculateDistanceAlphabetSize(params)
-    storeMetaBlockTrivial(
-      writer, ringBuffer, pos, blockLen, ringBufferMask,
-      isLast, commands, distAlphabetSize,
-      params.dist.distancePostfixBits, params.dist.numDirectDistanceCodes
+    storeMetaBlock(
+      writer, ring, this.metablockStart, metablockLen, mask,
+      isLast, this.commands, calculateDistanceAlphabetSize(params), params.quality,
+      npostfix, ndirect
     )
-    
-    // Update state
-    this.state.lastProcessedPos += blockLen
-    // lastInsertLen has been handled by adding to commands, so reset to 0
-    this.state.lastInsertLen = 0
-    this.state.numLiterals += numLiterals
-    
-    if (isLast) {
-      this.state.isLastBlockEmitted = true
-    }
-    
-    // Return any newly completed bytes
-    return writer.takeBytes()
+    this.commands = []
+    this.numLiterals = 0
+    this.metablockStart = this.searchedPos
   }
 }
-

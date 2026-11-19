@@ -2,7 +2,7 @@
 // Reference: woff2/brotli/c/enc/write_bits.h
 
 // Writes bits to a byte array in LSB-first order within each byte.
-// Inverse of BrotliBitReader.
+// Inverse of the decoder's bit reader.
 //
 // Bits written to increasing byte addresses; within a byte, LSB first.
 // Example: 3 bits 'RRR' written -> BYTE-0: 0000 0RRR
@@ -10,12 +10,10 @@
 export class BitWriter {
   buffer: Uint8Array
   pos: number // bit position
-  private flushedBytePos: number
 
   constructor(initialSize: number = 4096) {
     this.buffer = new Uint8Array(initialSize)
     this.pos = 0
-    this.flushedBytePos = 0
   }
 
   private ensureCapacity(bits: number): void {
@@ -28,61 +26,31 @@ export class BitWriter {
     }
   }
 
-  // Write up to 25 bits; for more use writeBitsLong
+  // Caps at 32 bits because JavaScript's bitwise operators are 32-bit and would
+  // drop the rest silently. Split wider values across calls: the stream is
+  // LSB-first, so low bits followed by high bits is the same encoding
   writeBits(nBits: number, value: number): void {
-    this.ensureCapacity(nBits)
-    
-    const bytePos = this.pos >>> 3
-    const bitOffset = this.pos & 7
-    
-    // Clear only the bits we're writing, preserve existing bits
-    // Then OR in the new value shifted to the right position
-    let v = this.buffer[bytePos] | 0
-    v |= (value << bitOffset)
-    this.buffer[bytePos] = v & 0xFF
-    
-    // Handle overflow into subsequent bytes
-    let bitsWritten = 8 - bitOffset
-    let remaining = value >>> bitsWritten
-    let pos = bytePos + 1
-    
-    while (bitsWritten < nBits) {
-      this.buffer[pos++] = remaining & 0xFF
-      remaining >>>= 8
-      bitsWritten += 8
+    if (nBits > 32) {
+      throw new Error(`BitWriter.writeBits: ${nBits} bits exceeds 32; split the value`)
     }
-    
-    this.pos += nBits
-  }
+    let bytePos = this.pos >>> 3
+    // 32 bits at any bit offset touch at most five bytes
+    if (bytePos + 6 > this.buffer.length) this.ensureCapacity(nBits)
+    const buffer = this.buffer
+    const bitOffset = this.pos & 7
 
-  // Write up to 56 bits using BigInt for precision
-  writeBitsLong(nBits: number, value: bigint): void {
-    if (nBits <= 25) {
-      this.writeBits(nBits, Number(value))
-      return
+    // The byte in progress keeps its low bits; every later byte is fresh
+    buffer[bytePos] |= value << bitOffset
+    let bitsWritten = 8 - bitOffset
+    if (bitsWritten < nBits) {
+      let remaining = value >>> bitsWritten
+      do {
+        buffer[++bytePos] = remaining
+        remaining >>>= 8
+        bitsWritten += 8
+      } while (bitsWritten < nBits)
     }
-    
-    this.ensureCapacity(nBits)
-    
-    const bytePos = this.pos >>> 3
-    const bitOffset = this.pos & 7
-    
-    // Shift value into position
-    let v = value << BigInt(bitOffset)
-    
-    // Write bytes
-    const bytesToWrite = ((nBits + bitOffset + 7) >>> 3)
-    
-    // First byte: OR with existing
-    this.buffer[bytePos] |= Number(v & 0xFFn)
-    v >>= 8n
-    
-    // Remaining bytes: overwrite
-    for (let i = 1; i < bytesToWrite; i++) {
-      this.buffer[bytePos + i] = Number(v & 0xFFn)
-      v >>= 8n
-    }
-    
+
     this.pos += nBits
   }
 
@@ -129,17 +97,20 @@ export class BitWriter {
 
   reset(): void {
     this.pos = 0
-    this.flushedBytePos = 0
     this.buffer.fill(0)
   }
 
-  // Return newly completed bytes since the last call.
-  // Never returns a partially-written byte (required for streaming)
+  // Removes and returns the completed bytes. A partially written byte stays
+  // behind, moved to the front, so the buffer does not grow with the stream
   takeBytes(): Uint8Array {
-    const end = this.pos >>> 3 // only fully-written bytes
-    if (end <= this.flushedBytePos) return new Uint8Array(0)
-    const out = this.buffer.slice(this.flushedBytePos, end)
-    this.flushedBytePos = end
+    const end = this.pos >>> 3
+    if (end === 0) return new Uint8Array(0)
+    const out = this.buffer.slice(0, end)
+    const partial = this.buffer[end]
+    // writeBits ORs into the first byte it touches, so the space must be clear
+    this.buffer.fill(0, 0, end + 1)
+    this.buffer[0] = partial
+    this.pos &= 7
     return out
   }
 

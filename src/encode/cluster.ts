@@ -1,11 +1,20 @@
 // Histogram clustering for Brotli compression
 // Reference: woff2/brotli/c/enc/cluster.h, cluster_inc.h
 
-import { populationCost } from './bit-cost'
+import {
+  populationCost,
+  populationCostSum,
+  occupancyMaskLength,
+  buildOccupancyMask,
+} from './bit-cost'
 import { fastLog2 } from './fast-log'
 
 export interface ClusterHistogram {
   data: Uint32Array
+  // One bit per symbol, set where data is nonzero. Maintained by the functions
+  // here; code that writes data directly leaves it stale, and clusterHistograms
+  // rebuilds it for its inputs
+  mask: Uint32Array
   totalCount: number
   bitCost: number
 }
@@ -33,6 +42,7 @@ function histogramPairIsLess(a: HistogramPair, b: HistogramPair): boolean {
 export function createClusterHistogram(size: number): ClusterHistogram {
   return {
     data: new Uint32Array(size),
+    mask: new Uint32Array(occupancyMaskLength(size)),
     totalCount: 0,
     bitCost: 0,
   }
@@ -40,12 +50,14 @@ export function createClusterHistogram(size: number): ClusterHistogram {
 
 export function clearClusterHistogram(h: ClusterHistogram): void {
   h.data.fill(0)
+  h.mask.fill(0)
   h.totalCount = 0
   h.bitCost = 0
 }
 
 export function copyClusterHistogram(a: ClusterHistogram, b: ClusterHistogram): void {
   b.data.set(a.data)
+  b.mask.set(a.mask)
   b.totalCount = a.totalCount
   b.bitCost = a.bitCost
 }
@@ -53,6 +65,9 @@ export function copyClusterHistogram(a: ClusterHistogram, b: ClusterHistogram): 
 export function addClusterHistograms(a: ClusterHistogram, b: ClusterHistogram): void {
   for (let i = 0; i < a.data.length; i++) {
     a.data[i] += b.data[i]
+  }
+  for (let i = 0; i < a.mask.length; i++) {
+    a.mask[i] |= b.mask[i]
   }
   a.totalCount += b.totalCount
 }
@@ -81,42 +96,34 @@ export function compareAndPushToQueue(
     idx2 = t
   }
   
-  const p: HistogramPair = {
-    idx1,
-    idx2,
-    costDiff: 0.5 * clusterCostDiff(clusterSize[idx1], clusterSize[idx2]),
-    costCombo: 0,
-  }
-  
-  p.costDiff -= out[idx1].bitCost
-  p.costDiff -= out[idx2].bitCost
-  
+  const h1 = out[idx1]
+  const h2 = out[idx2]
+  let costDiff = 0.5 * clusterCostDiff(clusterSize[idx1], clusterSize[idx2])
+  costDiff -= h1.bitCost
+  costDiff -= h2.bitCost
+
+  let costCombo = 0
   let isGoodPair = false
-  
-  if (out[idx1].totalCount === 0) {
-    p.costCombo = out[idx2].bitCost
+
+  if (h1.totalCount === 0) {
+    costCombo = h2.bitCost
     isGoodPair = true
-  } else if (out[idx2].totalCount === 0) {
-    p.costCombo = out[idx1].bitCost
+  } else if (h2.totalCount === 0) {
+    costCombo = h1.bitCost
     isGoodPair = true
   } else {
     const threshold = numPairs.value === 0 ? 1e99 :
       Math.max(0.0, pairs[0].costDiff)
-    
-    // Compute combined histogram cost
-    copyClusterHistogram(out[idx1], tmp)
-    addClusterHistograms(tmp, out[idx2])
-    const costCombo = computeClusterBitCost(tmp)
-    
-    if (costCombo < threshold - p.costDiff) {
-      p.costCombo = costCombo
-      isGoodPair = true
-    }
+    const limit = threshold - costDiff
+    costCombo = populationCostSum(
+      h1.data, h1.mask, h2.data, h2.mask, h1.totalCount + h2.totalCount, 0, limit)
+    isGoodPair = costCombo < limit
   }
-  
+
+  // Most candidates are rejected, so the pair is only allocated once kept
   if (isGoodPair) {
-    p.costDiff += p.costCombo
-    
+    const p: HistogramPair = { idx1, idx2, costCombo, costDiff: costDiff + costCombo }
+
     if (numPairs.value > 0 && histogramPairIsLess(pairs[0], p)) {
       // Replace top of queue if needed
       if (numPairs.value < maxNumPairs) {
@@ -230,15 +237,19 @@ export function histogramCombine(
 export function histogramBitCostDistance(
   histogram: ClusterHistogram,
   candidate: ClusterHistogram,
-  tmp: ClusterHistogram
+  tmp: ClusterHistogram,
+  // Distances at or above this are of no interest and may come back inexact
+  bestSoFar = Infinity
 ): number {
   if (histogram.totalCount === 0) {
     return 0.0
   }
-  
-  copyClusterHistogram(histogram, tmp)
-  addClusterHistograms(tmp, candidate)
-  return computeClusterBitCost(tmp) - candidate.bitCost
+
+  return populationCostSum(
+    histogram.data, histogram.mask, candidate.data, candidate.mask,
+    histogram.totalCount + candidate.totalCount,
+    candidate.bitCost, bestSoFar
+  ) - candidate.bitCost
 }
 
 export function histogramRemap(
@@ -256,7 +267,7 @@ export function histogramRemap(
     let bestBits = histogramBitCostDistance(input[i], out[bestOut], tmp)
     
     for (let j = 0; j < numClusters; j++) {
-      const curBits = histogramBitCostDistance(input[i], out[clusters[j]], tmp)
+      const curBits = histogramBitCostDistance(input[i], out[clusters[j]], tmp, bestBits)
       if (curBits < bestBits) {
         bestBits = curBits
         bestOut = clusters[j]
@@ -331,6 +342,7 @@ export function clusterHistograms(
   
   // Initialize
   for (let i = 0; i < inSize; i++) {
+    buildOccupancyMask(input[i].data, input[i].mask)
     clusterSize[i] = 1
     copyClusterHistogram(input[i], out[i])
     out[i].bitCost = computeClusterBitCost(input[i])
