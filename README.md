@@ -86,9 +86,9 @@ Decode times (Apple M2 Max, Node 22):
 | enc-ttf (305 KB) | 2.3 ms | 5.0 ms | 3.0 ms |
 | enc-otf (253 KB) | 2.2 ms | 4.7 ms | 2.8 ms |
 | enc-var-ttf (788 KB) | 5.7 ms | 12.6 ms | 7.4 ms |
-| noto-tc (7 MB) | 44 ms | 92 ms | 59 ms |
+| noto-tc (7 MB) | 46 ms | 99 ms | 60 ms |
 
-2x faster than brotli.js, ~30% faster than Google's JS decoder. Against Node's native `zlib.brotliDecompressSync`, warm decode is level on enc-ttf and enc-otf, about 15% slower on enc-var-ttf and about 30% slower on noto-tc. The first call in a process pays JIT warm-up (about 25 ms for a 300 KB font)
+2x faster than brotli.js, ~30% faster than Google's JS decoder. Node's native `zlib.brotliDecompressSync` is faster still: on these files it takes 1.4 to 1.5 ms, 3.9 ms and 33 ms, so warm decode here costs about 1.4 to 1.6 times native. The first call in a process also pays JIT warm-up (about 25 ms for a 300 KB font)
 
 Run `npm run bench` to reproduce
 
@@ -98,7 +98,7 @@ Output size and time against Node.js native `zlib.brotliCompressSync`, which is 
 
 | Quality | Text size | Text time | Font size | Font time |
 |---------|-----------|-----------|-----------|-----------|
-| 2 | +0.3 to +0.5% | 4-4.5x | -0.7 to -0.6% | 3.5x |
+| 2 | +0.3 to +0.5% | 3.5-4.5x | -0.7 to -0.6% | 3.5x |
 | 5 | -1.7 to -1.6% | 3.5-4.5x | +0.1 to +0.9% | 3.5x |
 | 9 | -1.7 to -1.6% | 3.5-4x | -5.0 to -3.6% | 6-8x |
 | 11 | 0 to +0.1% | 2x | +0.3 to +0.5% | 2x |
