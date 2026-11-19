@@ -88,7 +88,7 @@ Decode times (Apple M2 Max, Node 22):
 | enc-var-ttf (788 KB) | 5.7 ms | 12.6 ms | 7.4 ms |
 | noto-tc (7 MB) | 44 ms | 92 ms | 59 ms |
 
-2x faster than brotli.js, ~30% faster than Google's JS decoder. Against Node's native `zlib.brotliDecompressSync`, warm decode is level on the three fonts and about 30% slower on the 7 MB file. The first call in a process pays JIT warm-up (about 25 ms for a 300 KB font)
+2x faster than brotli.js, ~30% faster than Google's JS decoder. Against Node's native `zlib.brotliDecompressSync`, warm decode is level on enc-ttf and enc-otf, about 15% slower on enc-var-ttf and about 30% slower on noto-tc. The first call in a process pays JIT warm-up (about 25 ms for a 300 KB font)
 
 Run `npm run bench` to reproduce
 
