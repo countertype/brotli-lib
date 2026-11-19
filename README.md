@@ -88,7 +88,7 @@ Decode times (Apple M2 Max, Node 22):
 | enc-var-ttf (788 KB) | 5.7 ms | 12.6 ms | 7.4 ms |
 | noto-tc (7 MB) | 44 ms | 92 ms | 59 ms |
 
-2x faster than brotli.js, ~30% faster than Google's JS decoder. Warm decode runs at the speed of Node's native `zlib.brotliDecompressSync`; the first call in a process pays JIT warm-up (about 25 ms for a 300 KB font)
+2x faster than brotli.js, ~30% faster than Google's JS decoder. Against Node's native `zlib.brotliDecompressSync`, warm decode is level on the three fonts and about 30% slower on the 7 MB file. The first call in a process pays JIT warm-up (about 25 ms for a 300 KB font)
 
 Run `npm run bench` to reproduce
 
@@ -98,14 +98,14 @@ Output size and time against Node.js native `zlib.brotliCompressSync`, which is 
 
 | Quality | Text size | Text time | Font size | Font time |
 |---------|-----------|-----------|-----------|-----------|
-| 2 | +0.3 to +0.5% | 4x | -0.7 to -0.6% | 3.5x |
-| 5 | -1.7 to -1.6% | 3.5x | +0.1 to +0.9% | 3.5x |
-| 9 | -1.7 to -1.6% | 3x | -5.0 to -3.6% | 6-7x |
+| 2 | +0.3 to +0.5% | 4-4.5x | -0.7 to -0.6% | 3.5x |
+| 5 | -1.7 to -1.6% | 3.5-4.5x | +0.1 to +0.9% | 3.5x |
+| 9 | -1.7 to -1.6% | 3.5-4x | -5.0 to -3.6% | 6-8x |
 | 11 | 0 to +0.1% | 2x | +0.3 to +0.5% | 2x |
 
-Text is alice29.txt (152 KB) and lcet10.txt (427 KB) from the Canterbury corpus; fonts are a 313 KB TTF and a 259 KB OTF. Time is a multiple of native, warm
+Text is alice29.txt (149 KB) and lcet10.txt (417 KB) from the Canterbury corpus; fonts are enc-ttf and enc-otf from the decode table. Time is a multiple of native, warm, and moves by a few tenths from run to run
 
-Absolute times at quality 11: 350 ms for alice29.txt, 1.1 s for lcet10.txt, about 1.5 s for either font. At quality 5: 11 ms, 26 ms and 21 to 25 ms
+Absolute times at quality 11: 350 ms for alice29.txt, 1.1 s for lcet10.txt, 1.4 to 1.5 s for either font. At quality 5: 11 ms, 25 ms and 20 to 24 ms
 
 At qualities 7 to 9 binary input gets literal context modelling that the C encoder leaves out, which is where the smaller fonts and the extra time both come from
 
