@@ -153,6 +153,23 @@ describe('brotliEncode', () => {
     expect(q11.length).toBeGreaterThan(0)
   })
 
+  it('compresses at quality 0', () => {
+    const input = new Uint8Array(
+      readFileSync(join(__dirname, '../bench/fixtures/enc-otf.bin'))
+    )
+    const native = zlib.brotliCompressSync(input, {
+      params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 0 },
+    })
+
+    for (const encoded of [
+      brotliEncode(input, { quality: 0 }),
+      brotliEncodeNoDict(input, { quality: 0 }),
+    ]) {
+      expect(encoded.length).toBeLessThan(native.length)
+      expect(new Uint8Array(zlib.brotliDecompressSync(encoded))).toEqual(input)
+    }
+  })
+
   it('supports FONT mode', () => {
     // Simulate font-like data with repetitive 4-byte structures
     const fontData = new Uint8Array(4096)
