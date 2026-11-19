@@ -44,6 +44,7 @@
     "prepublishOnly": "npm run clean && npm run test && npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "fuzz": "npm run build && node test/fuzz.mjs",
     "bench": "vitest bench",
     "bench:encode": "vitest bench bench/encode.bench.ts",
     "bench:decode": "vitest bench bench/decode.bench.ts",
