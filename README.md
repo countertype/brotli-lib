@@ -55,10 +55,12 @@ function brotliEncode(
 
 class BrotliEncoder {
   constructor(options?: BrotliEncodeOptions)
-  update(chunk: Uint8Array): void
-  finish(): Uint8Array
+  update(chunk: Uint8Array): Uint8Array  // output ready so far, possibly empty
+  finish(): Uint8Array                   // the rest of the stream
 }
 ```
+
+`BrotliEncoder` takes input in chunks of any size and compresses to within a fraction of a percent of `brotliEncode` at the same quality. Output is produced a metablock at a time, so `update` often returns an empty array; concatenate everything `update` and `finish` return
 
 FONT mode uses distance coding parameters optimized for transformed font data. It doesn't improve compression on raw TTF/OTF files - the gains come from WOFF2's font-specific transforms (glyf, loca, hmtx) applied before brotli compression
 
@@ -68,7 +70,7 @@ FONT mode uses distance coding parameters optimized for transformed font data. I
 
 |  | brotli-lib | brotli.js | Google decode.ts |
 |--|------------|-----------|---------------|
-| Speed (vs Google) | 1.2x | 0.5-0.6x | 1x |
+| Speed (vs Google) | 1.3x | 0.6x | 1x |
 | Custom dictionary | yes | no | yes |
 | Compressed static dict | yes | yes | no |
 
@@ -76,36 +78,43 @@ Decode times (Apple M2 Max, Node 22):
 
 | File | brotli-lib | brotli.js | Google decode.ts |
 |------|------------|-----------|---------------|
-| enc-ttf (305 KB) | 2.3 ms | 4.4 ms | 2.9 ms |
-| enc-otf (253 KB) | 2.2 ms | 4.3 ms | 2.8 ms |
-| enc-var-ttf (788 KB) | 5.8 ms | 11.6 ms | 7.0 ms |
-| noto-tc (7 MB) | 47 ms | 90 ms | 57 ms |
+| enc-ttf (305 KB) | 2.3 ms | 5.0 ms | 3.0 ms |
+| enc-otf (253 KB) | 2.2 ms | 4.7 ms | 2.8 ms |
+| enc-var-ttf (788 KB) | 5.7 ms | 12.6 ms | 7.4 ms |
+| noto-tc (7 MB) | 44 ms | 92 ms | 59 ms |
 
-2x faster than brotli.js, ~20% faster than Google's JS decoder
+2x faster than brotli.js, ~30% faster than Google's JS decoder. Warm decode runs at the speed of Node's native `zlib.brotliDecompressSync`; the first call in a process pays JIT warm-up (about 25 ms for a 300 KB font)
+
+Run `npm run bench` to reproduce
 
 ### Encode
 
-Encoder vs Node.js native `zlib.brotliCompressSync` (quality 11):
+Output size and time against Node.js native `zlib.brotliCompressSync`, which is Google's C encoder, at the same quality. Size is relative to native output; negative is smaller
 
-| Input | brotli-lib | node:zlib | vs native |
-|-------|-----------|-----------|-----------|
-| 13 B | 0.001 ms | 0.16 ms | 160x faster |
-| 4.5 KB | 0.27 ms | 0.33 ms | 1.2x faster |
-| 45 KB | 3.0 ms | 1.4 ms | 2x slower |
+| Quality | Text size | Text time | Font size | Font time |
+|---------|-----------|-----------|-----------|-----------|
+| 2 | +0.3 to +0.5% | 4x | -0.7 to -0.6% | 3.5x |
+| 5 | -1.7 to -1.6% | 3.5x | +0.1 to +0.9% | 3.5x |
+| 9 | -1.7 to -1.6% | 3x | -5.0 to -3.6% | 6-7x |
+| 11 | 0 to +0.1% | 2x | +0.3 to +0.5% | 2x |
 
-Much faster for tiny inputs (no native binding overhead), faster for medium, ~2x slower for large
+Text is alice29.txt (152 KB) and lcet10.txt (427 KB) from the Canterbury corpus; fonts are a 313 KB TTF and a 259 KB OTF. Time is a multiple of native, warm
 
-Run `npm run bench` to reproduce
+Absolute times at quality 11: 350 ms for alice29.txt, 1.1 s for lcet10.txt, about 1.5 s for either font. At quality 5: 11 ms, 26 ms and 21 to 25 ms
+
+At qualities 7 to 9 binary input gets literal context modelling that the C encoder leaves out, which is where the smaller fonts and the extra time both come from
+
+Tiny inputs are much faster than native at any quality, since there is no binding overhead: a 13-byte input takes 0.0002 ms against 0.15 ms at quality 11. Inputs of a few KB take 0.03 to 0.08 ms at quality 5 to 9, about 2.5 to 4 times native
 
 ## Subpath exports
 
 | Import | Export size (gzip) |
 |--------|--------------------|
-| `brotli-lib/encode` | 25 KB |
-| `brotli-lib/decode` | 66 KB |
-| `brotli-lib` | 90 KB |
+| `brotli-lib/decode` | 67 KB |
+| `brotli-lib/encode` | 104 KB |
+| `brotli-lib` | 103 KB |
 
-The 122 KB static dictionary is compressed to 52 KB and bootstrapped at runtime (à la Devon Govett's brotli.js).
+The 122 KB static dictionary is compressed to 52 KB and bootstrapped at runtime (à la Devon Govett's brotli.js). The encoder matches against the dictionary too, so `brotli-lib/encode` carries it along with the decoder that unpacks it; importing both costs nothing extra
 
 ## License
 
