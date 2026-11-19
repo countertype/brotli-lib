@@ -15,10 +15,10 @@ import {
 } from './match'
 
 import {
-  searchInStaticDictionary,
+  StaticDictionary,
   createDictionarySearchState,
   DictionarySearchState,
-} from './static-dict-fast'
+} from './static-dict-types'
 import { MAX_ENCODABLE_DISTANCE } from './enc-constants'
 
 
@@ -31,6 +31,8 @@ const EMPTY_VIEW = new DataView(new ArrayBuffer(0))
 // written round-robin. A search reads one contiguous block instead of chasing
 // links through memory, which is what makes deep searches affordable
 export class HashChainHasher {
+  // Null in builds that leave the static dictionary out
+  dictionary: StaticDictionary | null = null
   private dictState: DictionarySearchState = createDictionarySearchState()
   // Slot blocks, one per key
   private buckets: Uint32Array
@@ -245,8 +247,9 @@ export class HashChainHasher {
     this.num[key] = n + 1
 
     // Only worth consulting when no backward reference beat the incoming score
-    if (minScore === out.score) {
-      searchInStaticDictionary(
+    const dictionary = this.dictionary
+    if (dictionary !== null && minScore === out.score) {
+      dictionary.search(
         data, curIxMasked, maxLength, maxBackward, MAX_ENCODABLE_DISTANCE,
         out, false, this.dictState
       )
@@ -269,8 +272,17 @@ declare const WeakRef: (new <T extends object>(target: T) => WeakHolder<T>) | un
 // `shared` hands out the pooled instance, which is only safe for a caller that
 // is done with it before anyone else can ask
 export function createHashChainHasher(
-  quality: number, lgwin: number, shared = true
+  quality: number,
+  lgwin: number,
+  dictionary: StaticDictionary | null = null,
+  shared = true
 ): HashChainHasher {
+  const hasher = acquireHasher(quality, lgwin, shared)
+  hasher.dictionary = dictionary
+  return hasher
+}
+
+function acquireHasher(quality: number, lgwin: number, shared: boolean): HashChainHasher {
   // Configuration based on quality level (from reference implementation)
   const bucketBits = quality < 7 ? 14 : 15
   const blockBits = quality - 1

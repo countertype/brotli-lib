@@ -15,8 +15,7 @@ export const SIZE_BITS_BY_LENGTH = new Uint8Array([
   7, 6, 6, 5, 5,
 ])
 
-export const MIN_DICTIONARY_WORD_LENGTH = 4
-export const MAX_DICTIONARY_WORD_LENGTH = 24
+export { MIN_DICTIONARY_WORD_LENGTH, MAX_DICTIONARY_WORD_LENGTH } from './static-dict-types'
 
 export const OFFSETS_BY_LENGTH = new Uint32Array(32)
 {

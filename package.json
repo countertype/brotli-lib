@@ -15,6 +15,11 @@
       "import": "./dist/encode.js",
       "require": "./dist/encode.cjs"
     },
+    "./encode-no-dict": {
+      "types": "./dist/encode-no-dict.d.ts",
+      "import": "./dist/encode-no-dict.js",
+      "require": "./dist/encode-no-dict.cjs"
+    },
     "./decode": {
       "types": "./dist/decode.d.ts",
       "import": "./dist/decode.js",

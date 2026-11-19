@@ -17,6 +17,14 @@ export default defineConfig([
       { file: 'dist/encode.cjs', format: 'cjs' },
     ],
   },
+  // Encode-only bundle without the static dictionary
+  {
+    input: 'src/encode-no-dict.ts',
+    output: [
+      { file: 'dist/encode-no-dict.js', format: 'esm' },
+      { file: 'dist/encode-no-dict.cjs', format: 'cjs' },
+    ],
+  },
   // Decode-only bundle
   {
     input: 'src/decode.ts',

@@ -16,7 +16,6 @@ import { Command, createCommand, createInsertCommand } from './command'
 import { SimpleHasher, STORE_LOOKAHEAD, MIN_MATCH_LEN as QUICK_MIN_MATCH_LEN } from './hash-simple'
 import { HashChainHasher, HASH_TYPE_LENGTH } from './hash-chains'
 import { BinaryTreeHasher } from './hash-binary-tree'
-import { searchInStaticDictionary } from './static-dict-fast'
 import { NUM_DISTANCE_SHORT_CODES, MAX_ENCODABLE_DISTANCE } from './enc-constants'
 
 export type Hasher = SimpleHasher | HashChainHasher | BinaryTreeHasher
@@ -200,7 +199,7 @@ export function createBackwardReferencesQuick(
   const sweep = hasher.sweep
   const sweepMask = hasher.sweepMask
   const hashShift = 32 - hasher.bucketBits
-  const useDictionary = hasher.useDictionary
+  const dictionary = hasher.dictionary
   const dictState = hasher.dictState
   const view = hasher.viewOf(data)
   const dataLength = data.length
@@ -284,14 +283,14 @@ export function createBackwardReferencesQuick(
 
     // Only worth consulting when no backward reference was found. The first
     // test repeats the lookup throttle so that a throttled call costs nothing
-    if (useDictionary && bestScore === MIN_SCORE &&
+    if (dictionary !== null && bestScore === MIN_SCORE &&
         dictState.numMatches >= (dictState.numLookups >> 7)) {
       dictResult.len = initialLen
       dictResult.distance = 0
       dictResult.score = MIN_SCORE
       dictResult.lenCodeDelta = 0
       dictResult.fromDictionary = false
-      searchInStaticDictionary(
+      dictionary.search(
         data, ixMasked, maxLen, maxBackward, MAX_ENCODABLE_DISTANCE,
         dictResult, true, dictState)
       bestScore = dictResult.score

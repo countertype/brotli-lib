@@ -23,8 +23,8 @@ import {
   TRANSFORM_IDX_UPPERCASE_ALL,
 } from './static-dict-lut'
 
-export const MAX_STATIC_DICTIONARY_MATCH_LEN = 37
-export const INVALID_MATCH = 0xFFFFFFFF
+import { MAX_STATIC_DICTIONARY_MATCH_LEN, INVALID_MATCH } from './static-dict-types'
+export { MAX_STATIC_DICTIONARY_MATCH_LEN, INVALID_MATCH }
 
 // transformId for an OMIT_LAST_<cut> transform is (cut << 2) + this table.
 // The reference packs these as 6-bit fields of a uint64; JavaScript's 32-bit

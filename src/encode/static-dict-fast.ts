@@ -15,6 +15,7 @@ import {
   MAX_DICTIONARY_WORD_LENGTH,
 } from './dictionary-data'
 import { backwardReferenceScore, HasherSearchResult } from './match'
+import type { DictionarySearchState } from './static-dict-types'
 
 const NUM_HASH_BITS = 14
 const NUM_HASH_BUCKETS = 1 << (NUM_HASH_BITS + 1)
@@ -100,16 +101,6 @@ function getFastDictionaryTable(): FastDictionaryTable {
   return table
 }
 
-// Lookup throttling: the reference gives up once the hit rate falls below
-// 1/128, which keeps incompressible input from paying for the probes
-export interface DictionarySearchState {
-  numLookups: number
-  numMatches: number
-}
-
-export function createDictionarySearchState(): DictionarySearchState {
-  return { numLookups: 0, numMatches: 0 }
-}
 
 function testItem(
   len: number, wordIdx: number, data: Uint8Array, pos: number,

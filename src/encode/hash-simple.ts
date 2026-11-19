@@ -2,7 +2,11 @@
 // Reference: woff2/brotli/c/enc/hash_longest_match_quickly_inc.h
 
 import { HASH_MUL_32, hashBytes8 } from './match'
-import { createDictionarySearchState, DictionarySearchState } from './static-dict-fast'
+import {
+  StaticDictionary,
+  createDictionarySearchState,
+  DictionarySearchState,
+} from './static-dict-types'
 
 export const Q2_BUCKET_BITS = 16
 export const Q4_BUCKET_BITS = 17
@@ -20,8 +24,8 @@ const EMPTY_VIEW = new DataView(new ArrayBuffer(0))
 // directly: at these qualities a call per position is a measurable cost
 export class SimpleHasher {
   dictState: DictionarySearchState = createDictionarySearchState()
-  // Set per hasher configuration; H3 is the one that runs without it
-  useDictionary = true
+  // Null for H3, which runs without it, and in builds that leave it out
+  dictionary: StaticDictionary | null = null
   readonly buckets: Uint32Array
   readonly bucketBits: number
   readonly bucketMask: number
@@ -39,10 +43,10 @@ export class SimpleHasher {
     this.buckets = new Uint32Array(bucketSize)
   }
 
-  configure(sweep: number, useDictionary: boolean): void {
+  configure(sweep: number, dictionary: StaticDictionary | null): void {
     this.sweep = sweep
     this.sweepMask = (sweep - 1) << 3
-    this.useDictionary = useDictionary
+    this.dictionary = dictionary
   }
 
   reset(): void {
@@ -110,11 +114,16 @@ let _cachedHasher16: SimpleHasher | null = null
 
 // `shared` hands out the cached instance, which is only safe for a caller that
 // is done with it before anyone else can ask
-export function createSimpleHasher(quality: number, lgwin: number, shared = true): SimpleHasher {
+export function createSimpleHasher(
+  quality: number,
+  lgwin: number,
+  dictionary: StaticDictionary | null = null,
+  shared = true
+): SimpleHasher {
   // Quality 2: one slot per key. Quality 3: two slots, no dictionary.
   // Quality 4: four slots and a larger table
   const sweep = quality <= 2 ? 1 : quality === 3 ? 2 : 4
-  const useDictionary = quality !== 3
+  if (quality === 3) dictionary = null
   let hasher: SimpleHasher
   if (!shared) {
     hasher = new SimpleHasher(quality >= 4 ? Q4_BUCKET_BITS : Q2_BUCKET_BITS, lgwin)
@@ -133,6 +142,6 @@ export function createSimpleHasher(quality: number, lgwin: number, shared = true
     }
     hasher = _cachedHasher16
   }
-  hasher.configure(sweep, useDictionary)
+  hasher.configure(sweep, dictionary)
   return hasher
 }

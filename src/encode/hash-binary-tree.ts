@@ -8,11 +8,11 @@ import {
   backwardReferenceScore,
 } from './match'
 import {
-  findAllStaticDictionaryMatches,
+  StaticDictionary,
   MAX_STATIC_DICTIONARY_MATCH_LEN,
   INVALID_MATCH,
-} from './static-dict'
-import { MIN_DICTIONARY_WORD_LENGTH } from './dictionary-data'
+  MIN_DICTIONARY_WORD_LENGTH,
+} from './static-dict-types'
 import { MAX_ENCODABLE_DISTANCE } from './enc-constants'
 
 export const BUCKET_BITS = 17
@@ -33,7 +33,15 @@ export class BinaryTreeHasher {
   // How far back the linear scan for length-2 matches looks
   private shortMatchMaxBackward: number
 
-  constructor(lgwin: number, inputSize?: number, shortMatchMaxBackward = 64) {
+  private dictionary: StaticDictionary | null
+
+  constructor(
+    lgwin: number,
+    inputSize?: number,
+    shortMatchMaxBackward = 64,
+    dictionary: StaticDictionary | null = null
+  ) {
+    this.dictionary = dictionary
     this.shortMatchMaxBackward = shortMatchMaxBackward
     this.windowMask = (1 << lgwin) - 1
     this.invalidPos = (0 - this.windowMask) >>> 0
@@ -231,11 +239,12 @@ export class BinaryTreeHasher {
     
     // All exceed bestLen and are appended in increasing length order, so the
     // array stays sorted
-    if (dictionaryDistance > 0 && maxLength >= MIN_DICTIONARY_WORD_LENGTH) {
+    const dictionary = this.dictionary
+    if (dictionary !== null && dictionaryDistance > 0 && maxLength >= MIN_DICTIONARY_WORD_LENGTH) {
       const dictMatches = this.dictMatches
       dictMatches.fill(INVALID_MATCH)
       const minLen = Math.max(MIN_DICTIONARY_WORD_LENGTH, bestLen + 1)
-      if (findAllStaticDictionaryMatches(data, curIxMasked, minLen, maxLength, dictMatches)) {
+      if (dictionary.findAll(data, curIxMasked, minLen, maxLength, dictMatches)) {
         const maxLen = Math.min(MAX_STATIC_DICTIONARY_MATCH_LEN, maxLength)
         for (let l = minLen; l <= maxLen; ++l) {
           const dictId = dictMatches[l]
@@ -314,8 +323,11 @@ export class BinaryTreeHasher {
 }
 
 export function createBinaryTreeHasher(
-  lgwin: number, inputSize?: number, quality = 11
+  lgwin: number,
+  inputSize?: number,
+  quality = 11,
+  dictionary: StaticDictionary | null = null
 ): BinaryTreeHasher {
   // Only the top quality pays for the wider scan
-  return new BinaryTreeHasher(lgwin, inputSize, quality === 11 ? 64 : 16)
+  return new BinaryTreeHasher(lgwin, inputSize, quality === 11 ? 64 : 16, dictionary)
 }

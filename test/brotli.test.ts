@@ -5,6 +5,10 @@ import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { brotliDecode, brotliDecodedSize } from '../src/decode/decode'
 import { brotliEncode, BrotliEncoder } from '../src/encode/encode'
+import {
+  brotliEncode as brotliEncodeNoDict,
+  BrotliEncoder as BrotliEncoderNoDict,
+} from '../src/encode/encode-no-dict'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -407,6 +411,50 @@ describe('decoding reference encoder output', () => {
     expect(() => brotliDecode(truncated)).toThrow()
     const decoded = brotliDecode(compressed)
     expect(Buffer.compare(Buffer.from(decoded), input)).toBe(0)
+  })
+})
+
+// The build without the static dictionary is the same encoder handed no
+// dictionary. Its output must stand on its own with any decoder
+describe('encoder without the static dictionary', () => {
+  const text = readFileSync(join(__dirname, 'fixtures', 'vectors', 'alice29.txt'))
+  const font = readFileSync(join(__dirname, '..', 'bench', 'fixtures', 'enc-otf.bin'))
+
+  for (const quality of [1, 2, 4, 5, 9, 10, 11]) {
+    it(`produces valid streams at quality ${quality}`, () => {
+      for (const input of [text, font]) {
+        const encoded = brotliEncodeNoDict(new Uint8Array(input), { quality })
+        expect(Buffer.compare(zlib.brotliDecompressSync(Buffer.from(encoded)), input)).toBe(0)
+      }
+    }, 30000)
+  }
+
+  it('streams', () => {
+    const encoder = new BrotliEncoderNoDict({ quality: 5 })
+    const parts = [encoder.update(new Uint8Array(text.subarray(0, 70000)))]
+    parts.push(encoder.update(new Uint8Array(text.subarray(70000))), encoder.finish())
+    expect(Buffer.compare(zlib.brotliDecompressSync(Buffer.concat(parts)), text)).toBe(0)
+  })
+
+  // Fonts hardly touch the dictionary, which is the case for offering this build
+  it('costs nothing on a font', () => {
+    const input = new Uint8Array(font)
+    const without = brotliEncodeNoDict(input, { quality: 5 }).length
+    expect(without).toBeLessThan(brotliEncode(input, { quality: 5 }).length * 1.002)
+  })
+
+  // Guards the split itself: if both builds reached the dictionary, short
+  // dictionary-friendly text would come out the same size from each
+  it('does not use the dictionary', () => {
+    const input = new TextEncoder().encode(
+      '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
+      '<title>The quick brown fox</title></head><body>' +
+      '<div class="container"><p>This is the first paragraph.</p></div></body></html>')
+    for (const quality of [5, 11]) {
+      const without = brotliEncodeNoDict(input, { quality })
+      expect(without.length).toBeGreaterThan(brotliEncode(input, { quality }).length)
+      expect(new Uint8Array(zlib.brotliDecompressSync(Buffer.from(without)))).toEqual(input)
+    }
   })
 })
 
