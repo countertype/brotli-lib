@@ -10,16 +10,12 @@ import {
   combineLengthCodes,
   getInsertExtra,
   getCopyExtra,
+  distancePrefixSymbol,
 } from './command'
-import { BinaryTreeHasher } from './hash-binary-tree'
+import { BinaryTreeHasher, WINDOW_GAP, MAX_TREE_COMP_LENGTH } from './hash-binary-tree'
 import { ZopfliCostModel, INFINITY_COST } from './zopfli-cost-model'
 import { NUM_DISTANCE_SHORT_CODES, maxZopfliLen, maxZopfliCandidates } from './enc-constants'
 import { backwardMatchLength } from './backward-references'
-import { log2FloorNonZero } from './fast-log'
-
-const DISTANCE_CACHE_INDEX = new Uint8Array([
-  0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1
-])
 
 const DISTANCE_CACHE_OFFSET = new Int8Array([
   0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3
@@ -27,67 +23,65 @@ const DISTANCE_CACHE_OFFSET = new Int8Array([
 
 const LONG_COPY_QUICK_STEP = 16384
 
-// Node in the Zopfli DP graph: optimal way to reach a position
-export interface ZopfliNode {
-  length: number           // copy length (low 25 bits) + length modifier (high 7 bits)
-  distance: number         // backward distance
-  dcodeInsertLength: number // insert length (low 27) + distance short code + 1 (high 5)
-  cost: number             // cost to reach this position, or next pointer during backtrack
-  shortcut: number         // for distance cache reconstruction
+// Zopfli DP nodes, one per input position: the cheapest known way to reach it.
+// Held as parallel typed arrays because the inner loop touches one field of
+// many nodes, and per-node objects cost a pointer chase each
+export interface ZopfliNodes {
+  size: number
+  length: Uint32Array            // copy length (low 25 bits) + length modifier (high 7 bits)
+  distance: Uint32Array          // backward distance
+  dcodeInsertLength: Uint32Array // insert length (low 27) + distance short code + 1 (high 5)
+  cost: Float64Array             // cost to reach this position, or next pointer during backtrack
+  shortcut: Uint32Array          // for distance cache reconstruction
 }
 
-export function createZopfliNodes(length: number): ZopfliNode[] {
-  const nodes: ZopfliNode[] = new Array(length)
-  for (let i = 0; i < length; i++) {
-    nodes[i] = {
-      length: 1,
-      distance: 0,
-      dcodeInsertLength: 0,
-      cost: INFINITY_COST,
-      shortcut: 0,
-    }
+export function createZopfliNodes(size: number): ZopfliNodes {
+  const nodes: ZopfliNodes = {
+    size,
+    length: new Uint32Array(size),
+    distance: new Uint32Array(size),
+    dcodeInsertLength: new Uint32Array(size),
+    cost: new Float64Array(size),
+    shortcut: new Uint32Array(size),
   }
+  resetZopfliNodes(nodes)
   return nodes
 }
 
-function resetZopfliNodes(nodes: ZopfliNode[]): void {
-  for (let i = 0; i < nodes.length; i++) {
-    const n = nodes[i]
-    n.length = 1
-    n.distance = 0
-    n.dcodeInsertLength = 0
-    n.cost = INFINITY_COST
-    n.shortcut = 0
-  }
+function resetZopfliNodes(nodes: ZopfliNodes): void {
+  nodes.length.fill(1)
+  nodes.distance.fill(0)
+  nodes.dcodeInsertLength.fill(0)
+  nodes.cost.fill(INFINITY_COST)
+  nodes.shortcut.fill(0)
 }
 
-// Zopfli node accessors
-function zopfliNodeCopyLength(node: ZopfliNode): number {
-  return node.length & 0x1FFFFFF
+function zopfliNodeCopyLength(nodes: ZopfliNodes, i: number): number {
+  return nodes.length[i] & 0x1FFFFFF
 }
 
-function zopfliNodeLengthCode(node: ZopfliNode): number {
-  const modifier = node.length >>> 25
-  return zopfliNodeCopyLength(node) + 9 - modifier
+function zopfliNodeLengthCode(nodes: ZopfliNodes, i: number): number {
+  const modifier = nodes.length[i] >>> 25
+  return zopfliNodeCopyLength(nodes, i) + 9 - modifier
 }
 
-function zopfliNodeCopyDistance(node: ZopfliNode): number {
-  return node.distance
+function zopfliNodeCopyDistance(nodes: ZopfliNodes, i: number): number {
+  return nodes.distance[i]
 }
 
-function zopfliNodeDistanceCode(node: ZopfliNode): number {
-  const shortCode = node.dcodeInsertLength >>> 27
+function zopfliNodeDistanceCode(nodes: ZopfliNodes, i: number): number {
+  const shortCode = nodes.dcodeInsertLength[i] >>> 27
   return shortCode === 0
-    ? zopfliNodeCopyDistance(node) + NUM_DISTANCE_SHORT_CODES - 1
+    ? zopfliNodeCopyDistance(nodes, i) + NUM_DISTANCE_SHORT_CODES - 1
     : shortCode - 1
 }
 
-function zopfliNodeCommandLength(node: ZopfliNode): number {
-  return zopfliNodeCopyLength(node) + (node.dcodeInsertLength & 0x7FFFFFF)
+function zopfliNodeCommandLength(nodes: ZopfliNodes, i: number): number {
+  return zopfliNodeCopyLength(nodes, i) + (nodes.dcodeInsertLength[i] & 0x7FFFFFF)
 }
 
-function zopfliNodeInsertLength(node: ZopfliNode): number {
-  return node.dcodeInsertLength & 0x7FFFFFF
+function zopfliNodeInsertLength(nodes: ZopfliNodes, i: number): number {
+  return nodes.dcodeInsertLength[i] & 0x7FFFFFF
 }
 
 interface PosData {
@@ -101,10 +95,10 @@ class StartPosQueue {
   private q: PosData[] = []
   private idx = 0
 
-  push(posdata: PosData): void {
+  // Called once per input position, so the eight slots are reused in place
+  push(pos: number, cost: number, costdiff: number, distanceCache: Int32Array): void {
     const offset = (~this.idx++) & 7
-    
-    // Ensure array has space
+
     while (this.q.length < 8) {
       this.q.push({
         pos: 0,
@@ -113,15 +107,13 @@ class StartPosQueue {
         cost: INFINITY_COST,
       })
     }
-    
-    // Insert at offset
-    this.q[offset] = {
-      pos: posdata.pos,
-      distanceCache: posdata.distanceCache.slice(),
-      costdiff: posdata.costdiff,
-      cost: posdata.cost,
-    }
-    
+
+    const slot = this.q[offset]
+    slot.pos = pos
+    slot.cost = cost
+    slot.costdiff = costdiff
+    slot.distanceCache.set(distanceCache)
+
     // Restore sorted order
     const len = this.size()
     for (let i = 1; i < len; i++) {
@@ -149,7 +141,7 @@ class StartPosQueue {
 }
 
 function updateZopfliNode(
-  nodes: ZopfliNode[],
+  nodes: ZopfliNodes,
   pos: number,
   startPos: number,
   len: number,
@@ -158,16 +150,16 @@ function updateZopfliNode(
   shortCode: number,
   cost: number
 ): void {
-  const next = nodes[pos + len]
-  next.length = len | ((len + 9 - lenCode) << 25)
-  next.distance = dist
-  next.dcodeInsertLength = (shortCode << 27) | (pos - startPos)
-  next.cost = cost
+  const next = pos + len
+  nodes.length[next] = len | ((len + 9 - lenCode) << 25)
+  nodes.distance[next] = dist
+  nodes.dcodeInsertLength[next] = (shortCode << 27) | (pos - startPos)
+  nodes.cost[next] = cost
 }
 
 function computeMinimumCopyLength(
   startCost: number,
-  nodes: ZopfliNode[],
+  nodes: ZopfliNodes,
   numBytes: number,
   pos: number
 ): number {
@@ -176,7 +168,7 @@ function computeMinimumCopyLength(
   let nextLenBucket = 4
   let nextLenOffset = 10
   
-  while (pos + len <= numBytes && nodes[pos + len].cost <= minCost) {
+  while (pos + len <= numBytes && nodes.cost[pos + len] <= minCost) {
     len++
     if (len === nextLenOffset) {
       // Reached next copy length code bucket
@@ -194,42 +186,43 @@ function computeDistanceShortcut(
   pos: number,
   maxBackwardLimit: number,
   gap: number,
-  nodes: ZopfliNode[]
+  nodes: ZopfliNodes
 ): number {
   if (pos === 0) return 0
   
-  const cLen = zopfliNodeCopyLength(nodes[pos])
-  const iLen = zopfliNodeInsertLength(nodes[pos])
-  const dist = zopfliNodeCopyDistance(nodes[pos])
+  const cLen = zopfliNodeCopyLength(nodes, pos)
+  const iLen = zopfliNodeInsertLength(nodes, pos)
+  const dist = zopfliNodeCopyDistance(nodes, pos)
   
   if (dist + cLen <= blockStart + pos + gap &&
       dist <= maxBackwardLimit + gap &&
-      zopfliNodeDistanceCode(nodes[pos]) > 0) {
+      zopfliNodeDistanceCode(nodes, pos) > 0) {
     return pos
   } else {
-    return nodes[pos - cLen - iLen].shortcut
+    return nodes.shortcut[pos - cLen - iLen]
   }
 }
 
 function computeDistanceCache(
   pos: number,
   startingDistCache: Int32Array,
-  nodes: ZopfliNode[],
+  nodes: ZopfliNodes,
   distCache: Int32Array
 ): void {
   let idx = 0
-  let p = nodes[pos].shortcut
+  let p = nodes.shortcut[pos]
   
   while (idx < 4 && p > 0) {
-    const iLen = zopfliNodeInsertLength(nodes[p])
-    const cLen = zopfliNodeCopyLength(nodes[p])
-    const dist = zopfliNodeCopyDistance(nodes[p])
+    const iLen = zopfliNodeInsertLength(nodes, p)
+    const cLen = zopfliNodeCopyLength(nodes, p)
+    const dist = zopfliNodeCopyDistance(nodes, p)
     distCache[idx++] = dist
-    p = nodes[p - cLen - iLen].shortcut
+    p = nodes.shortcut[p - cLen - iLen]
   }
   
-  for (; idx < 4; idx++) {
-    distCache[idx] = startingDistCache[idx - (4 - idx)]
+  // Remaining slots come from the start of startingDistCache, in order
+  for (let k = 0; idx < 4; idx++, k++) {
+    distCache[idx] = startingDistCache[k]
   }
 }
 
@@ -244,22 +237,17 @@ function evaluateNode(
   startingDistCache: Int32Array,
   model: ZopfliCostModel,
   queue: StartPosQueue,
-  nodes: ZopfliNode[]
+  nodes: ZopfliNodes
 ): void {
-  const nodeCost = nodes[pos].cost
-  nodes[pos].shortcut = computeDistanceShortcut(
+  const nodeCost = nodes.cost[pos]
+  nodes.shortcut[pos] = computeDistanceShortcut(
     blockStart, pos, maxBackwardLimit, gap, nodes
   )
   
   if (nodeCost <= model.getLiteralCosts(0, pos)) {
     computeDistanceCache(pos, startingDistCache, nodes, _evalDistCache)
     
-    queue.push({
-      pos,
-      cost: nodeCost,
-      costdiff: nodeCost - model.getLiteralCosts(0, pos),
-      distanceCache: _evalDistCache,
-    })
+    queue.push(pos, nodeCost, nodeCost - model.getLiteralCosts(0, pos), _evalDistCache)
   }
 }
 
@@ -277,7 +265,9 @@ function updateNodes(
   matches: BackwardMatch[],
   model: ZopfliCostModel,
   queue: StartPosQueue,
-  nodes: ZopfliNode[]
+  nodes: ZopfliNodes,
+  npostfix: number,
+  ndirect: number
 ): number {
   const curIx = blockStart + pos
   const curIxMasked = curIx & ringbufferMask
@@ -308,22 +298,28 @@ function updateNodes(
     
     // Try distance cache matches
     let bestLen = minLen - 1
+    const cache = posdata.distanceCache
+    const cache0 = cache[0]
+    const cache1 = cache[1]
     for (let j = 0; j < NUM_DISTANCE_SHORT_CODES && bestLen < maxLen; j++) {
-      const idx = DISTANCE_CACHE_INDEX[j]
-      const backward = posdata.distanceCache[idx] + DISTANCE_CACHE_OFFSET[j]
-      
+      // Codes 4-9 are offsets from the last distance, 10-15 from the one before
+      const backward = j < 4
+        ? cache[j]
+        : (j < 10 ? cache0 : cache1) + DISTANCE_CACHE_OFFSET[j]
+
       if (backward <= 0 || backward > maxDistance) continue
-      
-      let prevIx = curIx - backward
-      prevIx &= ringbufferMask
-      
+
+      const prevIx = (curIx - backward) & ringbufferMask
+
       // Check if continuation byte matches
       if (curIxMasked + bestLen > ringbufferMask) break
       if (ringbuffer[prevIx + bestLen] !== ringbuffer[curIxMasked + bestLen]) continue
-      
+
       const len = findMatchLength(ringbuffer, prevIx, curIxMasked, maxLen)
       
-      if (len >= 4) {
+      // No minimum here: a 2 or 3 byte copy at a recent distance is cheap
+      // enough to be worth taking, and minLen already bounds it from below
+      {
         const distCost = baseCost + model.getDistanceCost(j)
         
         for (let l = bestLen + 1; l <= len; l++) {
@@ -333,7 +329,7 @@ function updateNodes(
                        getCopyExtra(copyCode) +
                        model.getCommandCost(cmdCode)
           
-          if (cost < nodes[pos + l].cost) {
+          if (cost < nodes.cost[pos + l]) {
             updateZopfliNode(nodes, pos, start, l, l, backward, j + 1, cost)
             result = Math.max(result, l)
           }
@@ -352,11 +348,13 @@ function updateNodes(
       const dist = match.distance
       const isDictionaryMatch = dist > maxDistance
       
-      // Encode distance
+      // The cost table is indexed by distance symbol, not raw distance. A raw
+      // distance reads past the table and yields NaN, which loses the match
+      // silently since every comparison against NaN is false
       const distCode = dist + NUM_DISTANCE_SHORT_CODES - 1
-      const nbits = distCode < NUM_DISTANCE_SHORT_CODES ? 0 :
-                    log2FloorNonZero(dist) - 1
-      const distCost = baseCost + nbits + model.getDistanceCost(distCode & 0x3FF)
+      const distSymbol = distancePrefixSymbol(distCode, ndirect, npostfix)
+      const distNumExtra = distSymbol >> 10
+      const distCost = baseCost + distNumExtra + model.getDistanceCost(distSymbol & 0x3FF)
       
       // Try copy lengths up to match length
       let maxMatchLen = backwardMatchLength(match)
@@ -370,7 +368,7 @@ function updateNodes(
         const cmdCode = combineLengthCodes(insCode, copyCode, false)
         const cost = distCost + getCopyExtra(copyCode) + model.getCommandCost(cmdCode)
         
-        if (cost < nodes[pos + matchLen].cost) {
+        if (cost < nodes.cost[pos + matchLen]) {
           updateZopfliNode(nodes, pos, start, matchLen, lenCode, dist, 0, cost)
           result = Math.max(result, matchLen)
         }
@@ -381,24 +379,24 @@ function updateNodes(
   return result
 }
 
-function computeShortestPathFromNodes(numBytes: number, nodes: ZopfliNode[]): number {
+function computeShortestPathFromNodes(numBytes: number, nodes: ZopfliNodes): number {
   let index = numBytes
   let numCommands = 0
   
   // Find end of data (skip trailing unprocessed positions)
-  while ((nodes[index].dcodeInsertLength & 0x7FFFFFF) === 0 &&
-         nodes[index].length === 1) {
+  while ((nodes.dcodeInsertLength[index] & 0x7FFFFFF) === 0 &&
+         nodes.length[index] === 1) {
     index--
   }
   
   // Mark end
-  nodes[index].cost = 0xFFFFFFFF // next = MAX
+  nodes.cost[index] = 0xFFFFFFFF // next = MAX
   
   // Trace back and set next pointers
   while (index !== 0) {
-    const len = zopfliNodeCommandLength(nodes[index])
+    const len = zopfliNodeCommandLength(nodes, index)
     index -= len
-    nodes[index].cost = len // next = len
+    nodes.cost[index] = len // next = len
     numCommands++
   }
   
@@ -418,35 +416,44 @@ export function createZopfliBackwardReferences(
   distCache: Int32Array,
   lastInsertLen: number,
   npostfix: number = 0,
-  ndirect: number = 0
+  ndirect: number = 0,
+  maxBackwardLimit: number = ringbufferMask - WINDOW_GAP + 1
 ): [Command[], number, number] {
-  const maxBackwardLimit = (1 << 22) - 16 // lgwin=22 default
   const maxZopfliLenVal = maxZopfliLen(quality)
   
   // Allocate nodes
   const nodes = createZopfliNodes(numBytes + 1)
-  nodes[0].length = 0
-  nodes[0].cost = 0
+  nodes.length[0] = 0
+  nodes.cost[0] = 0
   
   // Initialize cost model from literals (first pass)
-  const distAlphabetSize = 544 // MAX_EFFECTIVE_DISTANCE_ALPHABET_SIZE
+  // Must be the real alphabet size: unseen symbols are priced from it
+  const distAlphabetSize = NUM_DISTANCE_SHORT_CODES + ndirect + (48 << npostfix)
   const model = new ZopfliCostModel(numBytes, distAlphabetSize)
   model.setFromLiteralCosts(position, ringbuffer, ringbufferMask)
   
   // Initialize queue
   const queue = new StartPosQueue()
   
+  // The tree hasher reads MAX_TREE_COMP_LENGTH bytes ahead of what it stores
+  const storeEnd = numBytes >= MAX_TREE_COMP_LENGTH
+    ? position + numBytes - MAX_TREE_COMP_LENGTH + 1
+    : position
+
   // Main DP loop
   for (let i = 0; i + 3 < numBytes; i++) {
     const pos = position + i
     const maxDistance = Math.min(pos, maxBackwardLimit)
     
     // Find all matches at this position
+    // Without a stream offset or compound dictionary the dictionary base
+    // distance is just maxDistance
     const matches = hasher.findAllMatches(
       ringbuffer,
       ringbufferMask,
       pos,
       numBytes - i,
+      maxDistance,
       maxDistance
     )
     
@@ -460,17 +467,29 @@ export function createZopfliBackwardReferences(
     }
     
     // Update DP nodes
-    const skip = updateNodes(
+    let skip = updateNodes(
       numBytes, position, i, ringbuffer, ringbufferMask,
       quality, maxBackwardLimit, distCache,
-      matches.length, matches, model, queue, nodes
+      matches.length, matches, model, queue, nodes,
+      npostfix, ndirect
     )
-    
-    // Skip ahead for very long matches
-    if (skip >= LONG_COPY_QUICK_STEP) {
-      i += skip - 1
-    } else if (matches.length === 1 && backwardMatchLength(matches[0]) > maxZopfliLenVal) {
-      i += backwardMatchLength(matches[0]) - 1
+
+    if (skip < LONG_COPY_QUICK_STEP) skip = 0
+    if (matches.length === 1 && backwardMatchLength(matches[0]) > maxZopfliLenVal) {
+      skip = Math.max(backwardMatchLength(matches[0]), skip)
+    }
+    if (skip > 1) {
+      hasher.storeRange(ringbuffer, ringbufferMask, pos + 1, Math.min(pos + skip, storeEnd))
+      // Skipped positions find no matches of their own, but each still has to
+      // be evaluated: that is what links it into the distance history that
+      // later positions are costed against
+      skip--
+      while (skip !== 0) {
+        i++
+        if (i + 3 >= numBytes) break
+        evaluateNode(position, i, maxBackwardLimit, 0, distCache, model, queue, nodes)
+        skip--
+      }
     }
   }
   
@@ -478,7 +497,7 @@ export function createZopfliBackwardReferences(
   computeShortestPathFromNodes(numBytes, nodes)
   
   // Create commands from path
-  return createCommandsFromPath(numBytes, position, nodes, distCache, lastInsertLen, npostfix, ndirect)
+  return createCommandsFromPath(numBytes, position, nodes, distCache, lastInsertLen, npostfix, ndirect, maxBackwardLimit)
 }
 
 // Two-pass optimization for quality 11
@@ -491,65 +510,64 @@ export function createHqZopfliBackwardReferences(
   distCache: Int32Array,
   lastInsertLen: number,
   npostfix: number = 0,
-  ndirect: number = 0
+  ndirect: number = 0,
+  maxBackwardLimit: number = ringbufferMask - WINDOW_GAP + 1
 ): [Command[], number, number] {
   const quality = 11
-  const maxBackwardLimit = (1 << 22) - 16
   const maxZopfliLenVal = maxZopfliLen(quality)
   
-  // First pass: collect all matches
+  // Keyed by position, not by a running counter: dictionary distances are
+  // relative to the position the match was found at, so they cannot be applied
+  // anywhere else
+  const storeEnd = numBytes >= MAX_TREE_COMP_LENGTH
+    ? position + numBytes - MAX_TREE_COMP_LENGTH + 1
+    : position
+  const emptyArr: BackwardMatch[] = []
   const allMatches: BackwardMatch[][] = new Array(numBytes)
   const numMatchesPerPos: number[] = new Array(numBytes)
-  let matchIdx = 0
-  
+  for (let i = 0; i < numBytes; i++) {
+    allMatches[i] = emptyArr
+    numMatchesPerPos[i] = 0
+  }
+
   for (let i = 0; i + 3 < numBytes; i++) {
     const pos = position + i
     const maxDistance = Math.min(pos, maxBackwardLimit)
-    
+
+    // Without a stream offset or compound dictionary the dictionary base
+    // distance is just maxDistance
     const matches = hasher.findAllMatches(
       ringbuffer,
       ringbufferMask,
       pos,
       numBytes - i,
+      maxDistance,
       maxDistance
     )
-    
-    // Handle very long matches
+
+    // A long enough match makes the positions it spans irrelevant
     if (matches.length > 0) {
       const longestMatch = matches[matches.length - 1]
       if (backwardMatchLength(longestMatch) > maxZopfliLenVal) {
         const skip = backwardMatchLength(longestMatch) - 1
-        allMatches[matchIdx] = [longestMatch]
-        numMatchesPerPos[matchIdx++] = 1
-        
-        // Skip positions
-        const emptyArr: BackwardMatch[] = []
-        for (let j = 0; j < skip && i + j + 1 < numBytes; j++) {
-          allMatches[matchIdx] = emptyArr
-          numMatchesPerPos[matchIdx++] = 0
-        }
+        allMatches[i] = [longestMatch]
+        numMatchesPerPos[i] = 1
+        hasher.storeRange(ringbuffer, ringbufferMask, pos + 1, Math.min(pos + skip + 1, storeEnd))
         i += skip
         continue
       }
     }
-    
-    allMatches[matchIdx] = matches
-    numMatchesPerPos[matchIdx++] = matches.length
+
+    allMatches[i] = matches
+    numMatchesPerPos[i] = matches.length
   }
-  
-  // Pad to full length
-  const emptyArr: BackwardMatch[] = []
-  while (matchIdx < numBytes) {
-    allMatches[matchIdx] = emptyArr
-    numMatchesPerPos[matchIdx++] = 0
-  }
-  
+
   // Save original state for second pass
   const origDistCache = distCache.slice()
   const origLastInsertLen = lastInsertLen
   
   // Allocate structures
-  const distAlphabetSize = 544
+  const distAlphabetSize = NUM_DISTANCE_SHORT_CODES + ndirect + (48 << npostfix)
   const model = new ZopfliCostModel(numBytes, distAlphabetSize)
   
   let commands: Command[] = []
@@ -562,8 +580,8 @@ export function createHqZopfliBackwardReferences(
   // Two iterations: first with literal costs, then with actual command costs
   for (let iteration = 0; iteration < 2; iteration++) {
     if (iteration > 0) resetZopfliNodes(nodes)
-    nodes[0].length = 0
-    nodes[0].cost = 0
+    nodes.length[0] = 0
+    nodes.cost[0] = 0
     
     // Reset state
     distCache.set(origDistCache)
@@ -584,23 +602,35 @@ export function createHqZopfliBackwardReferences(
       const numMatches = numMatchesPerPos[i]
       const matches = allMatches[i]
       
-      const skip = updateNodes(
+      let skip = updateNodes(
         numBytes, position, i, ringbuffer, ringbufferMask,
         quality, maxBackwardLimit, distCache,
-        numMatches, matches, model, queue, nodes
+        numMatches, matches, model, queue, nodes,
+        npostfix, ndirect
       )
-      
-      if (skip >= LONG_COPY_QUICK_STEP) {
-        i += skip - 1
-      } else if (numMatches === 1 && backwardMatchLength(matches[0]) > maxZopfliLenVal) {
-        i += backwardMatchLength(matches[0]) - 1
+
+      if (skip < LONG_COPY_QUICK_STEP) skip = 0
+      if (numMatches === 1 && backwardMatchLength(matches[0]) > maxZopfliLenVal) {
+        skip = Math.max(backwardMatchLength(matches[0]), skip)
+      }
+      if (skip > 1) {
+        // See createZopfliBackwardReferences: skipped positions still need
+        // evaluating to stay linked into the distance history
+        skip--
+        while (skip !== 0) {
+          i++
+          if (i + 3 >= numBytes) break
+          evaluateNode(position, i, maxBackwardLimit, 0, distCache, model, queue, nodes)
+          skip--
+        }
       }
     }
     
     // Compute path and create commands
     computeShortestPathFromNodes(numBytes, nodes)
     ;[commands, numLiterals, finalLastInsertLen] = createCommandsFromPath(
-      numBytes, position, nodes, distCache, lastInsertLen, npostfix, ndirect
+      numBytes, position, nodes, distCache, lastInsertLen, npostfix, ndirect,
+      maxBackwardLimit
     )
   }
   
@@ -610,23 +640,23 @@ export function createHqZopfliBackwardReferences(
 function createCommandsFromPath(
   numBytes: number,
   blockStart: number,
-  nodes: ZopfliNode[],
+  nodes: ZopfliNodes,
   distCache: Int32Array,
   lastInsertLen: number,
   npostfix: number = 0,
-  ndirect: number = 0
+  ndirect: number = 0,
+  maxBackwardLimit: number = (1 << 22) - 16
 ): [Command[], number, number] {
-  const maxBackwardLimit = (1 << 22) - 16
   const commands: Command[] = []
   let numLiterals = 0
   let pos = 0
-  let offset = nodes[0].cost // next pointer
+  let offset = nodes.cost[0] // next pointer
   let isFirst = true
   
   while (offset !== 0xFFFFFFFF && offset !== 0) {
-    const next = nodes[pos + offset]
-    const copyLen = zopfliNodeCopyLength(next)
-    let insertLen = zopfliNodeInsertLength(next)
+    const next = pos + offset
+    const copyLen = zopfliNodeCopyLength(nodes, next)
+    let insertLen = zopfliNodeInsertLength(nodes, next)
     
     pos += insertLen
     
@@ -635,9 +665,9 @@ function createCommandsFromPath(
       isFirst = false
     }
     
-    const distance = zopfliNodeCopyDistance(next)
-    const lenCode = zopfliNodeLengthCode(next)
-    const distCode = zopfliNodeDistanceCode(next)
+    const distance = zopfliNodeCopyDistance(nodes, next)
+    const lenCode = zopfliNodeLengthCode(nodes, next)
+    const distCode = zopfliNodeDistanceCode(nodes, next)
     
     // Create command
     const cmd = createCommand(
@@ -663,7 +693,7 @@ function createCommandsFromPath(
     
     numLiterals += insertLen
     pos += copyLen
-    offset = next.cost // next pointer
+    offset = nodes.cost[next] // next pointer
   }
   
   // Remaining literals

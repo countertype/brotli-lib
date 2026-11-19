@@ -33,9 +33,8 @@ export function createBlockSplit(maxBlocks: number = 256): BlockSplit {
 }
 
 function myRand(seed: { value: number }): number {
-  // Simple linear congruential generator
-  seed.value = (seed.value * 16807) | 0
-  if (seed.value < 0) seed.value += 0x7FFFFFFF
+  // Unsigned 32-bit wraparound, so sample positions match the reference
+  seed.value = Math.imul(seed.value, 16807) >>> 0
   return seed.value
 }
 
@@ -109,8 +108,10 @@ function refineEntropyCodes(
   }
 }
 
+// Subtracted from log2(total), so an absent symbol costs 2 bits more than one
+// seen once
 function bitCost(count: number): number {
-  return count === 0 ? fastLog2(1) + 2 : fastLog2(count)
+  return count === 0 ? -2 : fastLog2(count)
 }
 
 // DP on insert costs
@@ -297,7 +298,7 @@ export function splitByteVector(
   
   // Find blocks using the entropy codes
   const blockIds = new Uint8Array(length)
-  const iters = quality < 10 ? 3 : 10
+  const iters = quality < 11 ? 3 : 10
   let numBlocks = 0
   
   for (let i = 0; i < iters; i++) {
@@ -368,7 +369,12 @@ function clusterBlocks(
   let nextIndex = 0
   let curLength = 0
   let splitBlockIdx = 0
-  
+
+  if (split.types.length < numBlocks) {
+    split.types = new Uint8Array(numBlocks)
+    split.lengths = new Uint32Array(numBlocks)
+  }
+
   for (let i = 0; i < numBlocks; i++) {
     curLength += blockLengths[i]
     
@@ -419,11 +425,12 @@ export function splitBlock(
     insertAndCopyCodes.push(cmd.cmdPrefix)
     
     // Collect distance code (if not implicit)
-    if (cmd.cmdPrefix >= 128) {
+    const copyLen = commandCopyLen(cmd)
+    if (copyLen && cmd.cmdPrefix >= 128) {
       distanceCodes.push(cmd.distPrefix & 0x3FF)
     }
-    
-    pos += commandCopyLen(cmd)
+
+    pos += copyLen
   }
   
   // Split literals (alphabet size 256)
@@ -431,7 +438,7 @@ export function splitBlock(
     const literalData = new Uint8Array(literals)
     splitByteVector(
       literalData, literals.length, 256,
-      512, 64, 70, 26.0, quality, literalSplit
+      544, 100, 70, 28.1, quality, literalSplit
     )
   } else {
     literalSplit.numTypes = 1
@@ -443,7 +450,7 @@ export function splitBlock(
     const cmdData = new Uint16Array(insertAndCopyCodes)
     splitByteVector(
       cmdData, insertAndCopyCodes.length, 704,
-      1024, 64, 50, 28.1, quality, insertAndCopySplit
+      530, 50, 40, 13.5, quality, insertAndCopySplit
     )
   } else {
     insertAndCopySplit.numTypes = 1
@@ -455,7 +462,7 @@ export function splitBlock(
     const distData = new Uint16Array(distanceCodes)
     splitByteVector(
       distData, distanceCodes.length, 544,
-      512, 64, 50, 28.1, quality, distSplit
+      544, 50, 40, 14.6, quality, distSplit
     )
   } else {
     distSplit.numTypes = 1

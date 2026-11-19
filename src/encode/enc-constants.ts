@@ -231,3 +231,11 @@ export function createDefaultParams(): EncoderParams {
     },
   }
 }
+
+// The one-shot encoder hands the whole input to the match search rather than a
+// circular buffer, so positions into it must not be masked; the window is
+// enforced separately by maxBackwardLimit
+export const FLAT_INPUT_MASK = 0x7FFFFFFF
+
+// Largest distance the distance alphabet can represent
+export const MAX_ENCODABLE_DISTANCE = 0x7FFFFFFC

@@ -5,6 +5,10 @@ import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { brotliDecode, brotliDecodedSize } from '../src/decode/decode'
 import { brotliEncode, BrotliEncoder } from '../src/encode/encode'
+import {
+  brotliEncode as brotliEncodeNoDict,
+  BrotliEncoder as BrotliEncoderNoDict,
+} from '../src/encode/encode-no-dict'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -173,6 +177,21 @@ describe('brotliEncode', () => {
     expect(decodedFont).toEqual(fontData)
   })
 
+  // Hash tables are reused from one call to the next; nothing an earlier
+  // input left in them may show up in a later output
+  it('gives the same output whatever was encoded before', () => {
+    const vectors = join(__dirname, 'fixtures', 'vectors')
+    const a = new Uint8Array(readFileSync(join(vectors, 'alice29.txt')))
+    const b = new Uint8Array(readFileSync(join(__dirname, '..', 'bench', 'fixtures', 'enc-otf.bin')))
+    for (const quality of [2, 4, 5, 7, 9]) {
+      const first = brotliEncode(a, { quality })
+      brotliEncode(b, { quality })
+      const again = brotliEncode(a, { quality })
+      expect(Buffer.compare(Buffer.from(again), Buffer.from(first))).toBe(0)
+      expect(Buffer.compare(zlib.brotliDecompressSync(Buffer.from(again)), Buffer.from(a))).toBe(0)
+    }
+  })
+
   describe('streaming encoder', () => {
     it('encodes in chunks', () => {
       const encoder = new BrotliEncoder({ quality: 5 })
@@ -192,6 +211,55 @@ describe('brotliEncode', () => {
       const encoder = new BrotliEncoder()
       const result = encoder.finish()
       expect(result.length).toBeGreaterThan(0)
+    })
+
+    const fixtures = join(__dirname, '..', 'bench', 'fixtures')
+    const streamEncode = (
+      input: Uint8Array, options: { quality: number, lgwin?: number }, chunkSize: number
+    ): Uint8Array => {
+      const encoder = new BrotliEncoder(options)
+      const parts: Uint8Array[] = []
+      for (let pos = 0; pos < input.length; pos += chunkSize) {
+        parts.push(encoder.update(input.subarray(pos, pos + chunkSize)))
+      }
+      parts.push(encoder.finish())
+      return new Uint8Array(Buffer.concat(parts))
+    }
+
+    // The search is the only part not shared with the one-shot path, and it
+    // sees the same data, so the two should land within a fraction of a percent
+    for (const quality of [2, 4, 5, 9, 11]) {
+      it(`matches one-shot output size at quality ${quality}`, () => {
+        const input = new Uint8Array(readFileSync(join(fixtures, 'enc-ttf.bin')))
+        const streamed = streamEncode(input, { quality }, 10000)
+        const decoded = zlib.brotliDecompressSync(Buffer.from(streamed))
+        expect(Buffer.compare(decoded, Buffer.from(input))).toBe(0)
+        expect(streamed.length).toBeLessThan(brotliEncode(input, { quality }).length * 1.01)
+      }, 30000)
+    }
+
+    // The input is copied into a ring a block at a time; one call far larger
+    // than the ring must not overwrite data that has yet to be encoded
+    it('accepts a single update larger than its buffer', () => {
+      const input = new Uint8Array(readFileSync(join(fixtures, 'enc-var-ttf.bin')))
+      const streamed = streamEncode(input, { quality: 5, lgwin: 16 }, input.length)
+      const decoded = zlib.brotliDecompressSync(Buffer.from(streamed))
+      expect(Buffer.compare(decoded, Buffer.from(input))).toBe(0)
+    })
+
+    it('handles a window smaller than a block', () => {
+      const input = new Uint8Array(readFileSync(join(__dirname, 'fixtures', 'vectors', 'lcet10.txt')))
+      for (const quality of [5, 9]) {
+        const streamed = streamEncode(input, { quality, lgwin: 10 }, 50000)
+        const decoded = zlib.brotliDecompressSync(Buffer.from(streamed))
+        expect(Buffer.compare(decoded, Buffer.from(input))).toBe(0)
+      }
+    })
+
+    it('rejects input after finish', () => {
+      const encoder = new BrotliEncoder({ quality: 5 })
+      encoder.finish()
+      expect(() => encoder.update(new Uint8Array(1))).toThrow()
     })
   })
 })
@@ -308,6 +376,320 @@ describe('fuzz', () => {
 
       const decoded = brotliDecode(encoded)
       expect(decoded).toEqual(input)
+    }
+  })
+})
+
+// Streams from the reference encoder's top qualities use features this
+// library's own encoder may not emit: hundreds of literal trees, and a distance
+// context map much smaller than the literal one
+describe('decoding reference encoder output', () => {
+  const fixtures = join(__dirname, '..', 'bench', 'fixtures')
+
+  for (const name of ['enc-otf.bin', 'enc-ttf.bin']) {
+    for (const quality of [9, 10, 11]) {
+      it(`decodes ${name} compressed at quality ${quality}`, () => {
+        const input = readFileSync(join(fixtures, name))
+        const compressed = zlib.brotliCompressSync(input, {
+          params: {
+            [zlib.constants.BROTLI_PARAM_QUALITY]: quality,
+            [zlib.constants.BROTLI_PARAM_SIZE_HINT]: input.length,
+          },
+        })
+        const decoded = brotliDecode(new Uint8Array(compressed))
+        expect(Buffer.compare(Buffer.from(decoded), input)).toBe(0)
+      })
+    }
+  }
+
+  it('decodes correctly after a failed decode', () => {
+    const input = readFileSync(join(fixtures, 'enc-otf.bin'))
+    const compressed = new Uint8Array(zlib.brotliCompressSync(input, {
+      params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 },
+    }))
+    const truncated = compressed.subarray(0, compressed.length >> 1)
+    expect(() => brotliDecode(truncated)).toThrow()
+    const decoded = brotliDecode(compressed)
+    expect(Buffer.compare(Buffer.from(decoded), input)).toBe(0)
+  })
+})
+
+// The build without the static dictionary is the same encoder handed no
+// dictionary. Its output must stand on its own with any decoder
+describe('encoder without the static dictionary', () => {
+  const text = readFileSync(join(__dirname, 'fixtures', 'vectors', 'alice29.txt'))
+  const font = readFileSync(join(__dirname, '..', 'bench', 'fixtures', 'enc-otf.bin'))
+
+  for (const quality of [1, 2, 4, 5, 9, 10, 11]) {
+    it(`produces valid streams at quality ${quality}`, () => {
+      for (const input of [text, font]) {
+        const encoded = brotliEncodeNoDict(new Uint8Array(input), { quality })
+        expect(Buffer.compare(zlib.brotliDecompressSync(Buffer.from(encoded)), input)).toBe(0)
+      }
+    }, 30000)
+  }
+
+  it('streams', () => {
+    const encoder = new BrotliEncoderNoDict({ quality: 5 })
+    const parts = [encoder.update(new Uint8Array(text.subarray(0, 70000)))]
+    parts.push(encoder.update(new Uint8Array(text.subarray(70000))), encoder.finish())
+    expect(Buffer.compare(zlib.brotliDecompressSync(Buffer.concat(parts)), text)).toBe(0)
+  })
+
+  // Fonts hardly touch the dictionary, which is the case for offering this build
+  it('costs nothing on a font', () => {
+    const input = new Uint8Array(font)
+    const without = brotliEncodeNoDict(input, { quality: 5 }).length
+    expect(without).toBeLessThan(brotliEncode(input, { quality: 5 }).length * 1.002)
+  })
+
+  // Guards the split itself: if both builds reached the dictionary, short
+  // dictionary-friendly text would come out the same size from each
+  it('does not use the dictionary', () => {
+    const input = new TextEncoder().encode(
+      '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
+      '<title>The quick brown fox</title></head><body>' +
+      '<div class="container"><p>This is the first paragraph.</p></div></body></html>')
+    for (const quality of [5, 11]) {
+      const without = brotliEncodeNoDict(input, { quality })
+      expect(without.length).toBeGreaterThan(brotliEncode(input, { quality }).length)
+      expect(new Uint8Array(zlib.brotliDecompressSync(Buffer.from(without)))).toEqual(input)
+    }
+  })
+})
+
+// Round-tripping through our own decoder cannot show that a stream is
+// well-formed brotli, only that the two agree. These check against the
+// reference decoder instead
+describe('encoder output validity (reference C decoder)', () => {
+  const vectorsDir = join(__dirname, 'fixtures', 'vectors')
+  const corpus = ['alice29.txt', 'asyoulik.txt', 'lcet10.txt', 'compressed_repeated']
+
+  for (const name of corpus) {
+    for (const quality of [9, 10, 11]) {
+      it(`${name} at quality ${quality} is accepted by the C decoder`, () => {
+        const input = new Uint8Array(readFileSync(join(vectorsDir, name)))
+        const encoded = brotliEncode(input, { quality })
+        const roundTripped = new Uint8Array(zlib.brotliDecompressSync(Buffer.from(encoded)))
+        expect(roundTripped).toEqual(input)
+      })
+    }
+  }
+
+  // Font tables are far more repetitive than prose: long matches, and match
+  // trees deep enough to hit the search depth limit
+  // Qualities 2 and 3 also split this input across several metablocks
+  for (const quality of [2, 3, 4, 5, 9, 10, 11]) {
+    it(`a font at quality ${quality} is accepted by the C decoder`, () => {
+      const input = readFileSync(join(__dirname, '..', 'bench', 'fixtures', 'enc-otf.bin'))
+      const encoded = brotliEncode(new Uint8Array(input), { quality })
+      const roundTripped = zlib.brotliDecompressSync(Buffer.from(encoded))
+      expect(Buffer.compare(roundTripped, input)).toBe(0)
+    })
+  }
+
+  // Binary data leans on block splitting, signed literal contexts and the
+  // distance parameters far more than prose does; losing any of them costs
+  // several percent here and nothing on text
+  for (const quality of [2, 4, 5, 10]) {
+    it(`a font at quality ${quality} lands close to the reference encoder`, () => {
+      const input = readFileSync(join(__dirname, '..', 'bench', 'fixtures', 'enc-otf.bin'))
+      const ours = brotliEncode(new Uint8Array(input), { quality }).length
+      const reference = zlib.brotliCompressSync(input, {
+        params: {
+          [zlib.constants.BROTLI_PARAM_QUALITY]: quality,
+          [zlib.constants.BROTLI_PARAM_SIZE_HINT]: input.length,
+        },
+      }).length
+      expect(ours).toBeLessThan(reference * 1.03)
+    })
+  }
+
+  // A command's insert and copy extra-bit fields together can exceed 32 bits,
+  // which is more than a single shift can carry
+  it('handles a command with a large insert length and a long copy', () => {
+    const nextU32 = makeXorshift32(0x5EED1234)
+    // Incompressible head forces one long insert; the repeated tail forces a
+    // copy length needing more than eight extra bits
+    const head = randomBytes(60000, nextU32)
+    const tail = new Uint8Array(4096)
+    for (let i = 0; i < tail.length; i++) tail[i] = head[i % 977]
+    const input = new Uint8Array(head.length + tail.length)
+    input.set(head, 0)
+    input.set(tail, head.length)
+
+    for (const quality of [10, 11]) {
+      const encoded = brotliEncode(input, { quality })
+      const roundTripped = new Uint8Array(zlib.brotliDecompressSync(Buffer.from(encoded)))
+      expect(roundTripped).toEqual(input)
+    }
+  })
+
+  // Guards the cost model: a mis-indexed cost table drops matches silently, and
+  // shows up only as higher qualities doing worse
+  it('compresses no worse at higher quality', () => {
+    for (const name of ['alice29.txt', 'asyoulik.txt']) {
+      const input = new Uint8Array(readFileSync(join(vectorsDir, name)))
+      const sizes = [5, 9, 10, 11].map(quality => brotliEncode(input, { quality }).length)
+      for (let i = 1; i < sizes.length; i++) {
+        expect(sizes[i]).toBeLessThanOrEqual(sizes[i - 1])
+      }
+    }
+  })
+})
+
+// Dictionary references are distances beyond the sliding window, resolved
+// through the RFC transform table. A wrong transform index or distance base
+// corrupts the stream, so these assert on real output rather than internals
+describe('static dictionary matching', () => {
+  const vectorsDir = join(__dirname, 'fixtures', 'vectors')
+
+  // The bound is only reachable with dictionary references, so losing them
+  // fails here rather than passing quietly at a worse ratio
+  it('uses the dictionary on short dictionary-friendly text', () => {
+    const html = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
+      '<title>The quick brown fox</title></head><body>' +
+      '<div class="container"><p>This is the first paragraph.</p></div></body></html>'
+    const input = new TextEncoder().encode(html)
+    for (const quality of [10, 11]) {
+      const encoded = brotliEncode(input, { quality })
+      expect(encoded.length).toBeLessThan(120)
+      const roundTripped = new Uint8Array(zlib.brotliDecompressSync(Buffer.from(encoded)))
+      expect(roundTripped).toEqual(input)
+    }
+  })
+
+  // Covers the whole match, transform and distance path against real prose
+  it('lands close to the reference encoder on corpus text', () => {
+    for (const name of ['alice29.txt', 'asyoulik.txt']) {
+      const input = new Uint8Array(readFileSync(join(vectorsDir, name)))
+      const ours = brotliEncode(input, { quality: 11 }).length
+      const reference = zlib.brotliCompressSync(Buffer.from(input), {
+        params: {
+          [zlib.constants.BROTLI_PARAM_QUALITY]: 11,
+          [zlib.constants.BROTLI_PARAM_SIZE_HINT]: input.length,
+        },
+      }).length
+      expect(ours).toBeLessThan(reference * 1.05)
+    }
+  })
+
+  // The fast qualities use a cheaper lookup than 10 and 11, so they need their
+  // own bound; these are only reachable with dictionary references
+  it('uses the dictionary at the fast qualities too', () => {
+    const html = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
+      '<title>The quick brown fox</title></head><body>' +
+      '<div class="container"><p>This is the first paragraph.</p></div></body></html>'
+    const prose = 'The following information about the company and the people that ' +
+      'work there is available on the website. Please contact us for more details ' +
+      'about the products and services.'
+    for (const quality of [5, 9]) {
+      const htmlEncoded = brotliEncode(new TextEncoder().encode(html), { quality })
+      expect(htmlEncoded.length).toBeLessThan(132)
+      expect(new Uint8Array(zlib.brotliDecompressSync(Buffer.from(htmlEncoded))))
+        .toEqual(new TextEncoder().encode(html))
+
+      const proseEncoded = brotliEncode(new TextEncoder().encode(prose), { quality })
+      expect(proseEncoded.length).toBeLessThan(100)
+      expect(new Uint8Array(zlib.brotliDecompressSync(Buffer.from(proseEncoded))))
+        .toEqual(new TextEncoder().encode(prose))
+    }
+  })
+
+  // Hashers are pooled between calls, so output must not depend on what was
+  // compressed before. Incompressible data is the likeliest to leave state
+  // skewed behind it
+  it('produces identical output regardless of what was encoded before', () => {
+    const input = new Uint8Array(readFileSync(join(vectorsDir, 'asyoulik.txt')))
+    const nextU32 = makeXorshift32(0x9E3779B9)
+    const noise = randomBytes(200000, nextU32)
+    for (const quality of [2, 3, 4, 5, 9]) {
+      const first = brotliEncode(input, { quality }).length
+      brotliEncode(noise, { quality })
+      const second = brotliEncode(input, { quality }).length
+      expect(second).toBe(first)
+    }
+  })
+
+  // Many distinct words, transforms and suffixes in a single stream
+  it('round-trips text exercising many dictionary transforms', () => {
+    const parts = [
+      'The following information about the company and the people that work there.',
+      'DOWNLOAD THE FILE FROM THE INTERNET',
+      'running and jumping and swimming in the water of the world',
+      '<div class="content"><a href="http://www.example.com/index.html">',
+      'The University of California, the National Institute, the President said.',
+      'description, information, development, government, university, international',
+    ]
+    const input = new TextEncoder().encode(parts.join('\n'))
+    for (const quality of [10, 11]) {
+      const encoded = brotliEncode(input, { quality })
+      const roundTripped = new Uint8Array(zlib.brotliDecompressSync(Buffer.from(encoded)))
+      expect(roundTripped).toEqual(input)
+    }
+  })
+})
+
+// A window smaller than the input makes the decoder's ring buffer wrap and
+// stops the encoder from indexing the input directly. Both paths are otherwise
+// untouched, since the default window exceeds anything else the suite feeds
+describe('windows smaller than the input', () => {
+  function repetitiveText(len: number, seed: number): Uint8Array {
+    const nextU32 = makeXorshift32(seed)
+    const words = ['the ', 'quick ', 'information ', 'government ', '<div class="',
+      '">', 'function ', 'return ', '\r\n', '    ', 'download ']
+    const out = new Uint8Array(len)
+    let p = 0
+    while (p < len) {
+      const w = words[nextU32() % words.length]
+      for (let k = 0; k < w.length && p < len; k++) out[p++] = w.charCodeAt(k)
+    }
+    return out
+  }
+
+  // A small window also caps the metablock size, so this input spans several.
+  // Literal context carries over from one to the next, and prose is where a
+  // wrong starting context changes which tree a literal is coded with
+  for (const quality of [5, 9, 10, 11]) {
+    it(`carries literal context across metablocks at quality ${quality}`, () => {
+      const input = readFileSync(join(__dirname, 'fixtures', 'vectors', 'lcet10.txt'))
+      const encoded = brotliEncode(new Uint8Array(input), { quality, lgwin: 10 })
+      const decoded = zlib.brotliDecompressSync(Buffer.from(encoded))
+      expect(Buffer.compare(decoded, input)).toBe(0)
+    })
+  }
+
+  for (const lgwin of [10, 11, 12, 14, 16]) {
+    it(`round-trips input far larger than a ${1 << lgwin}-byte window`, () => {
+      const input = repetitiveText(60000, 0x1234 + lgwin)
+      for (const quality of [2, 5, 9]) {
+        const encoded = brotliEncode(input, { quality, lgwin })
+        expect(new Uint8Array(zlib.brotliDecompressSync(Buffer.from(encoded)))).toEqual(input)
+        expect(brotliDecode(encoded)).toEqual(input)
+      }
+    })
+
+    it(`decodes reference-encoded streams at a ${1 << lgwin}-byte window`, () => {
+      const input = repetitiveText(60000, 0x5678 + lgwin)
+      const encoded = zlib.brotliCompressSync(Buffer.from(input), {
+        params: {
+          [zlib.constants.BROTLI_PARAM_QUALITY]: 5,
+          [zlib.constants.BROTLI_PARAM_LGWIN]: lgwin,
+          [zlib.constants.BROTLI_PARAM_SIZE_HINT]: input.length,
+        },
+      })
+      expect(brotliDecode(new Uint8Array(encoded))).toEqual(input)
+    })
+  }
+
+  // The wrap has to work at the default window too, not just tiny ones
+  it('round-trips input past the default 4 MiB window', () => {
+    const input = repetitiveText(5_000_000, 0xABCD)
+    for (const quality of [2, 5]) {
+      const encoded = brotliEncode(input, { quality })
+      // toEqual walks typed arrays element by element, too slow at this size
+      const decoded = zlib.brotliDecompressSync(Buffer.from(encoded))
+      expect(Buffer.compare(decoded, Buffer.from(input))).toBe(0)
     }
   })
 })

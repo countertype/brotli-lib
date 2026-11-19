@@ -2,6 +2,7 @@
 // Reference: woff2/brotli/c/enc/backward_references_hq.c
 
 import { fastLog2 } from './fast-log'
+import { estimateBitCostsForLiterals } from './literal-cost'
 import { NUM_LITERAL_CODES, NUM_COMMAND_CODES } from './enc-constants'
 import { Command, commandCopyLen } from './command'
 
@@ -31,26 +32,18 @@ export class ZopfliCostModel {
     ringbuffer: Uint8Array,
     ringbufferMask: number
   ): void {
-    // Estimate literal costs based on byte frequencies
-    const literalHistograms = new Float64Array(3 * 256)
-    this.estimateBitCostsForLiterals(
-      position,
-      this.numBytes,
-      ringbufferMask,
-      ringbuffer,
-      literalHistograms
-    )
-    
-    // Build cumulative literal costs
+    const costs = estimateBitCostsForLiterals(
+      position, this.numBytes, ringbufferMask, ringbuffer)
+
+    // Running sum with a compensation term, since these are 32-bit floats
     this.literalCosts[0] = 0
     let literalCarry = 0
     for (let i = 0; i < this.numBytes; i++) {
-      const byte = ringbuffer[(position + i) & ringbufferMask]
-      literalCarry += literalHistograms[byte]
+      literalCarry += costs[i]
       this.literalCosts[i + 1] = this.literalCosts[i] + literalCarry
       literalCarry -= this.literalCosts[i + 1] - this.literalCosts[i]
     }
-    
+
     // Simple cost model for commands: log2(11 + i)
     for (let i = 0; i < NUM_COMMAND_CODES; i++) {
       this.costCmd[i] = fastLog2(11 + i)
@@ -156,34 +149,6 @@ export class ZopfliCostModel {
         if (cost[i] < 1) {
           cost[i] = 1
         }
-      }
-    }
-  }
-
-  private estimateBitCostsForLiterals(
-    position: number,
-    numBytes: number,
-    ringbufferMask: number,
-    ringbuffer: Uint8Array,
-    costs: Float64Array
-  ): void {
-    // Simple cost model: 8 bits per literal with some context adjustment
-    // A more sophisticated implementation would use 3-context model
-    const histogram = new Uint32Array(256)
-    
-    // Build histogram
-    for (let i = 0; i < numBytes; i++) {
-      histogram[ringbuffer[(position + i) & ringbufferMask]]++
-    }
-    
-    // Convert to costs
-    const log2total = fastLog2(numBytes)
-    for (let i = 0; i < 256; i++) {
-      if (histogram[i] === 0) {
-        costs[i] = log2total + 2
-      } else {
-        costs[i] = log2total - fastLog2(histogram[i])
-        if (costs[i] < 1) costs[i] = 1
       }
     }
   }

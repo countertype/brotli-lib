@@ -5,7 +5,7 @@ import { brotliDecode as engineDecode, peekDecodedSize } from './engine'
 
 // Reads uncompressed size from first metablock header
 // Returns -1 if stream has multiple metablocks (can't determine total without decoding)
-// Uses zero-allocation header peek (no BrotliBitReader/BrotliInput overhead)
+// Uses zero-allocation header peek: reads bits straight from the raw bytes
 export function brotliDecodedSize(buffer: Uint8Array): number {
   return peekDecodedSize(buffer);
 }

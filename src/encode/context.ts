@@ -175,56 +175,5 @@ export function getContextInline(p1: number, p2: number, mode: ContextType): num
   return CONTEXT_LOOKUP_TABLE[offset + p1] | CONTEXT_LOOKUP_TABLE[offset + 256 + p2]
 }
 
-// Choose best context mode for a block of data
-export function chooseContextMode(data: Uint8Array, start: number, length: number): ContextType {
-  // Sample the data to determine character types
-  let asciiCount = 0
-  let utf8LeadCount = 0
-  let utf8ContCount = 0
-  let signedPatternCount = 0
-  
-  const sampleSize = Math.min(length, 1024)
-  const step = Math.max(1, Math.floor(length / sampleSize))
-  
-  for (let i = 0; i < length; i += step) {
-    const byte = data[start + i]
-    
-    if (byte < 128) {
-      asciiCount++
-      // Check for signed integer patterns (small deltas)
-      if (i > 0) {
-        const prev = data[start + i - 1]
-        const diff = Math.abs(byte - prev)
-        if (diff < 16) signedPatternCount++
-      }
-    } else if (byte >= 192) {
-      utf8LeadCount++
-    } else {
-      utf8ContCount++
-    }
-  }
-  
-  const total = asciiCount + utf8LeadCount + utf8ContCount
-  if (total === 0) return ContextType.LSB6
-  
-  // If we see UTF-8 patterns (lead + continuation bytes), use UTF8 mode
-  if (utf8LeadCount > 0 && utf8ContCount > utf8LeadCount * 0.5) {
-    return ContextType.UTF8
-  }
-  
-  // If we see signed integer patterns, use SIGNED mode
-  if (signedPatternCount > total * 0.3) {
-    return ContextType.SIGNED
-  }
-  
-  // For mostly ASCII text, UTF8 mode still works well
-  if (asciiCount > total * 0.7) {
-    return ContextType.UTF8
-  }
-  
-  // Default to LSB6 for binary data
-  return ContextType.LSB6
-}
-
 export const NUM_LITERAL_CONTEXTS = 64
 export const NUM_DISTANCE_CONTEXTS = 4

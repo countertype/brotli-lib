@@ -106,6 +106,27 @@ export function getCopyExtra(copyCode: number): number {
   return COPY_LENGTH_EXTRA[copyCode]
 }
 
+// The symbol half of prefixEncodeCopyDistance (extra-bit count in the high
+// bits), without the tuple. For cost lookups in inner loops
+export function distancePrefixSymbol(
+  distanceCode: number,
+  numDirectCodes: number,
+  postfixBits: number
+): number {
+  if (distanceCode < NUM_DISTANCE_SHORT_CODES + numDirectCodes) {
+    return distanceCode
+  }
+  const dist = (1 << (postfixBits + 2)) +
+    (distanceCode - NUM_DISTANCE_SHORT_CODES - numDirectCodes)
+  const bucket = log2FloorNonZero(dist) - 1
+  const postfix = dist & ((1 << postfixBits) - 1)
+  const prefix = (dist >>> bucket) & 1
+  const nbits = bucket - postfixBits
+  return (nbits << 10) |
+    (NUM_DISTANCE_SHORT_CODES + numDirectCodes +
+     ((2 * (nbits - 1) + prefix) << postfixBits) + postfix)
+}
+
 // Encode copy distance into code and extra bits
 // distance_code: 0-15 = short codes, 16+ = distance + NUM_DISTANCE_SHORT_CODES - 1
 export function prefixEncodeCopyDistance(

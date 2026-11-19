@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.1.0 - 2026-11-18
+
+### Fixes
+
+- Decoder
+  - Valid streams could be rejected with error -4 when the distance context map was smaller than the literal one (seen with the reference encoder's quality 10 and 11 output on fonts); a decode after a failed one could fail the same way
+  - A stream ending inside a literal run could loop forever
+  - A copy ending exactly at the output buffer boundary could skip the buffer wrap (streams larger than their window)
+- Encoder
+  - Quality 10 and 11 could produce corrupt streams (match tree depth limit, distance cache, cost table indexing, commands with more than 32 extra bits)
+  - Inputs larger than the window, and inputs spanning several metablocks (over 16 MB, or any size at small `lgwin`), could produce corrupt streams at quality 5 and up
+  - `BrotliEncoder` produced corrupt output for an `update()` larger than its buffer and for windows smaller than a block
+  - The hash chain search could fail to terminate
+
+### Compression
+
+- Output is now within about 1% of the reference C encoder at every quality, and smaller at 5 to 9 (text 1.6% smaller; fonts 3.5 to 5% smaller at 7 to 9). Before: 3 to 10% larger at 2 to 4, 7 to 10% larger on fonts at 10 and 11
+- Static dictionary matching at all qualities
+- Block splitting ported faithfully (cost sign, sampling, limits), plus the reference's greedy splitter below quality 10 and block splitting at quality 4
+- Distance parameter search (NPOSTFIX, NDIRECT) and signed literal contexts for binary data
+- Lazy matching, short copies at recent distances, multi-slot hashing at quality 3 and 4, short metablocks at quality 2 and 3
+- `BrotliEncoder` shares everything after the match search with `brotliEncode` and compresses within a fraction of a percent of it (was 2 to 12% worse)
+
+### Performance
+
+- Encoder, against 0.0.7 on the same inputs
+  - Text: 2.5 to 3.9x faster at every quality
+  - Fonts: 2.3x faster at quality 2, 7 to 30x at 5 to 9, 1.6x at 11
+  - 4-byte loads for hashing, candidate filtering and match length
+  - Dedicated search loop for quality 2 to 4
+  - Hash tables reused across calls at quality 5 to 9, the large ones held weakly (a 4.5 KB input at quality 9: 2 ms to 0.03 ms)
+  - Histogram cost visits only nonzero symbols, with early exit; clustering allocates nothing per candidate
+  - Zopfli nodes held in typed arrays; no `BigInt`
+  - `BrotliEncoder` no longer retains output it has already returned
+- Decoder
+  - 3 to 10% faster: command loop moved to its own function, hot state in locals, 4-byte copies
+
+### Changed
+
+- `brotli-lib/encode` now includes the static dictionary and the decoder that unpacks it (104 KB gzipped, was 25 KB). `brotli-lib/decode` is unchanged
+- New `brotli-lib/encode-no-dict`: the same encoder without dictionary matching (32 KB gzipped). No loss on fonts; text is under 1% larger at quality 5 to 9 and 3 to 5% larger at 11, short text considerably more
+- `BrotliEncoder.update()` throws after `finish()`
+- Removed unused decoder modules `bit-reader` and `streams`
+
 ## 0.0.7 - 2026-02-11
 
 ### Performance
