@@ -25,15 +25,17 @@
 
 ### Performance
 
-- Encoder
-  - 4-byte loads for hashing, candidate filtering and match length (quality 5 to 9 about 25% faster on text)
-  - Dedicated search loop for quality 2 to 4 (about 20 to 27% faster)
+- Encoder, against 0.0.7 on the same inputs
+  - Text: 2.5 to 3.9x faster at every quality
+  - Fonts: 2.3x faster at quality 2, 7 to 30x at 5 to 9, 1.6x at 11
+  - 4-byte loads for hashing, candidate filtering and match length
+  - Dedicated search loop for quality 2 to 4
   - Hash tables reused across calls at quality 5 to 9, the large ones held weakly (a 4.5 KB input at quality 9: 2 ms to 0.03 ms)
   - Histogram cost visits only nonzero symbols, with early exit; clustering allocates nothing per candidate
   - Zopfli nodes held in typed arrays; no `BigInt`
   - `BrotliEncoder` no longer retains output it has already returned
 - Decoder
-  - Command loop moved to its own function, hot state in locals, 4-byte copies
+  - 3 to 10% faster: command loop moved to its own function, hot state in locals, 4-byte copies
 
 ### Changed
 
