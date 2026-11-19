@@ -28,6 +28,11 @@ const compressed = brotliEncode(data, { quality: 11 })
 import { brotliEncode, brotliDecode } from 'brotli-lib'
 ```
 
+```typescript
+// Same encoder without the static dictionary: a third of the size
+import { brotliEncode } from 'brotli-lib/encode-no-dict'
+```
+
 ## API
 
 ### Decode
@@ -112,9 +117,21 @@ Tiny inputs are much faster than native at any quality, since there is no bindin
 |--------|--------------------|
 | `brotli-lib/decode` | 67 KB |
 | `brotli-lib/encode` | 104 KB |
+| `brotli-lib/encode-no-dict` | 32 KB |
 | `brotli-lib` | 103 KB |
 
 The 122 KB static dictionary is compressed to 52 KB and bootstrapped at runtime (à la Devon Govett's brotli.js). The encoder matches against the dictionary too, so `brotli-lib/encode` carries it along with the decoder that unpacks it; importing both costs nothing extra
+
+`brotli-lib/encode-no-dict` is the same encoder and API with dictionary matching left out. Its output is ordinary brotli that any decoder reads. What it gives up, measured against `brotli-lib/encode`:
+
+| Input | Quality 5 and 9 | Quality 11 |
+|-------|-----------------|------------|
+| Fonts | nothing | under 0.5% either way |
+| JSON, source code | 0.2 to 1% larger | 1 to 3% larger |
+| Prose | about 0.5% larger | 3.5 to 5% larger |
+| Short HTML (under a few KB) | 30 to 45% larger | 55 to 75% larger |
+
+Use it for fonts and other binary data, or wherever bundle size matters more than the last few percent. Keep the default for short text, where the dictionary does most of the work
 
 ## License
 

@@ -38,6 +38,7 @@
 ### Changed
 
 - `brotli-lib/encode` now includes the static dictionary and the decoder that unpacks it (104 KB gzipped, was 25 KB). `brotli-lib/decode` is unchanged
+- New `brotli-lib/encode-no-dict`: the same encoder without dictionary matching (32 KB gzipped). No loss on fonts; text is under 1% larger at quality 5 to 9 and 3 to 5% larger at 11, short text considerably more
 - `BrotliEncoder.update()` throws after `finish()`
 - Removed unused decoder modules `bit-reader` and `streams`
 
