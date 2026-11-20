@@ -1,6 +1,6 @@
-import { bench, describe } from 'vitest'
+import { describe, test } from 'vitest'
 import * as zlib from 'zlib'
-import { brotliEncode } from '../src/encode/encode'
+import { brotliEncode } from '../dist/encode.js'
 
 // Test data
 const shortText = 'Hello, World!'
@@ -29,14 +29,17 @@ console.log('')
 for (const quality of [1, 5, 11]) {
   describe(`quality ${quality}`, () => {
     for (const { name, data } of inputs) {
-      bench(`brotli-lib ${name}`, () => {
-        brotliEncode(data, { quality })
-      })
-
-      bench(`node:zlib ${name}`, () => {
-        zlib.brotliCompressSync(data, {
-          params: { [zlib.constants.BROTLI_PARAM_QUALITY]: quality }
-        })
+      test(name, async ({ bench }) => {
+        await bench.compare(
+          bench('brotli-lib', () => {
+            brotliEncode(data, { quality })
+          }),
+          bench('node:zlib', () => {
+            zlib.brotliCompressSync(data, {
+              params: { [zlib.constants.BROTLI_PARAM_QUALITY]: quality }
+            })
+          })
+        )
       })
     }
   })

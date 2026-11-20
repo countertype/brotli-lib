@@ -1,9 +1,9 @@
-import { bench, describe } from 'vitest'
+import { describe, test } from 'vitest'
 import * as zlib from 'node:zlib'
 import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { brotliEncode } from '../src/encode/encode'
+import { brotliEncode } from '../dist/encode.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -40,16 +40,21 @@ console.log(`\n[encode:q11] fixture=${label} size=${sizeLabel}`)
 console.log(`[encode:q11] ratio ours=${oursOnce.length} native=${nativeOnce.length} (${(oursOnce.length / nativeOnce.length).toFixed(2)}x)\n`)
 
 describe(`quality 11 (fixture: ${label}, ${sizeLabel})`, () => {
-  bench('brotli-lib encode', () => {
-    brotliEncode(data, { quality: 11 })
-  })
-
-  if (INCLUDE_ZLIB) {
-    bench('node:zlib encode', () => {
+  test('encode', async ({ bench }) => {
+    const ours = bench('brotli-lib', () => {
+      brotliEncode(data, { quality: 11 })
+    })
+    // One encode takes seconds, so the default of 64 iterations is out of reach
+    const options = { iterations: 5, time: 0, warmupIterations: 1, warmupTime: 0 }
+    if (!INCLUDE_ZLIB) {
+      await ours.run(options)
+      return
+    }
+    await bench.compare(ours, bench('node:zlib', () => {
       zlib.brotliCompressSync(data, {
         params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 },
       })
-    })
-  }
+    }), options)
+  })
 })
 

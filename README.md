@@ -116,9 +116,9 @@ Tiny inputs are much faster than native at any quality, since there is no bindin
 | Import | Export size (gzip) |
 |--------|--------------------|
 | `brotli-lib/decode` | 67 KB |
-| `brotli-lib/encode` | 104 KB |
-| `brotli-lib/encode-no-dict` | 32 KB |
-| `brotli-lib` | 103 KB |
+| `brotli-lib/encode` | 103 KB |
+| `brotli-lib/encode-no-dict` | 31 KB |
+| `brotli-lib` | 102 KB |
 
 The 122 KB static dictionary is compressed to 52 KB and bootstrapped at runtime (à la Devon Govett's brotli.js). The encoder matches against the dictionary too, so `brotli-lib/encode` carries it along with the decoder that unpacks it; importing both costs nothing extra
 
