@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 - 2026-11-19
+
+### Fixes
+
+- `brotliEncode` at quality 0 stored the input uncompressed. It now compresses like quality 1, as `BrotliEncoder` already did
+
 ## 0.1.0 - 2026-11-18
 
 ### Fixes

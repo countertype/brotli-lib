@@ -1,19 +1,19 @@
 // Decode benchmark with statistical significance testing (Welch's t-test)
 // Usage: npm run bench
 //        BENCH_SAMPLES=50 npm run bench
-import { bench, describe } from 'vitest'
+import { describe, test, type BenchRegistration } from 'vitest'
 import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { performance } from 'node:perf_hooks'
 import { createRequire } from 'node:module'
-import { brotliDecode } from '../src/decode/decode'
+import { brotliDecode } from '../dist/decode.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url)
 
 let originalDecompress: ((buf: Buffer) => Uint8Array) | null = null
 try {
-  originalDecompress = require('brotli/decompress')
+  originalDecompress = require('brotli/decompress').decompress
 } catch {
   console.log('[bench] brotli.js not available')
 }
@@ -90,39 +90,33 @@ if (googleDecompress) {
 console.log('')
 
 // Vitest benchmarks
-describe('brotli-lib decode', () => {
+describe('decode', () => {
   for (const fixture of fixtures) {
     const sizeLabel = fixture.originalSize > 1024 * 1024
       ? `${(fixture.originalSize / 1024 / 1024).toFixed(1)} MB`
       : `${(fixture.originalSize / 1024).toFixed(0)} KB`
-    bench(`${fixture.name} (${sizeLabel})`, () => {
-      brotliDecode(fixture.compressed)
+    test(`${fixture.name} (${sizeLabel})`, async ({ bench }) => {
+      const runs: BenchRegistration<string>[] = [
+        bench('brotli-lib', () => {
+          brotliDecode(fixture.compressed)
+        }),
+      ]
+      if (originalDecompress) {
+        const buffer = Buffer.from(fixture.compressed)
+        runs.push(bench('brotli.js', () => {
+          originalDecompress!(buffer)
+        }))
+      }
+      if (googleDecompress) {
+        runs.push(bench('google brotli', () => {
+          googleDecompress!(fixture.compressed)
+        }))
+      }
+      if (runs.length === 1) await runs[0].run()
+      else await bench.compare(...runs)
     })
   }
 })
-
-if (originalDecompress) {
-  describe('brotli.js', () => {
-    for (const fixture of fixtures) {
-      const buffer = Buffer.from(fixture.compressed)
-      const sizeLabel = `${(fixture.originalSize / 1024).toFixed(0)} KB`
-      bench(`${fixture.name} (${sizeLabel})`, () => {
-        originalDecompress!(buffer)
-      })
-    }
-  })
-}
-
-if (googleDecompress) {
-  describe('google brotli', () => {
-    for (const fixture of fixtures) {
-      const sizeLabel = `${(fixture.originalSize / 1024).toFixed(0)} KB`
-      bench(`${fixture.name} (${sizeLabel})`, () => {
-        googleDecompress!(fixture.compressed)
-      })
-    }
-  })
-}
 
 // Stats helpers
 function collectSamples(fn: () => void, warmup: number, samples: number): number[] {

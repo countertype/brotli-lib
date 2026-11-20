@@ -61,18 +61,17 @@ export function encode(
   sanitizeParams(params)
   params.lgblock = computeLgBlock(params)
   
-  // For very small inputs or quality 0, use uncompressed
   if (input.length === 0) {
     return encodeEmptyInput()
   }
-  
-  // Use uncompressed for quality 0 or small inputs where compression overhead dominates
-  if (params.quality === 0 || input.length < 64) {
+
+  // Too short for a metablock header to pay for itself
+  if (input.length < 64) {
     return encodeUncompressed(input)
   }
-  
-  // For quality 1, use fast compression
-  if (params.quality === 1) {
+
+  // Quality 0 and 1 share the fastest compressing path
+  if (params.quality <= 1) {
     return encodeFast(input, params, dictionary)
   }
 
